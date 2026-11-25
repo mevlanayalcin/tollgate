@@ -139,7 +139,7 @@ echo "$SUB_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d[
 MCP_OUT=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tollgate_chain_summary","arguments":{}}}\n' \
   | "$ROOT/bin/tollgate-agent" mcp --rpc "$RPC_URL" --realm "$R_PATH")
 echo "$MCP_OUT" | grep -q "tollgate_paid_fetch"
-echo "$MCP_OUT" | grep -q 'services\":1'
+echo "$MCP_OUT" | python3 -c "import sys,json; lines=[json.loads(l) for l in sys.stdin if l.strip()]; d=json.loads(lines[1]['result']['content'][0]['text']); assert d['services']==1 and d['vaultBalanceUgnot']==50000, d"
 
 echo "[7/7] Settling metered batch on-chain via ClaimSettlement & verifying identical SHA-256 commitment..."
 RES_HASH=$(echo "$PASS_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['resourceHash'])")
