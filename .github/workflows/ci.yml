@@ -1,0 +1,33 @@
+name: Tollgate CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Go SDK & middleware tests (race detector)
+        run: go test -race -v ./...
+      - name: Build gateway & MCP agent binaries
+        run: |
+          go build -o ./bin/tollgate-gateway ./cmd/tollgate-gateway
+          go build -o ./bin/tollgate-agent ./cmd/tollgate-agent
+      - name: TypeScript SDK cross-language tests
+        run: cd sdk/ts && npm test
+      - name: Download Gno v1.8.0-rc.1 and run gno test & lint
+        run: |
+          curl -sSL https://github.com/gnolang/gno/releases/download/v1.8.0-rc.1/gno_linux_amd64 -o /tmp/gno
+          chmod +x /tmp/gno
+          git clone --depth 1 --branch v1.8.0-rc.1 https://github.com/gnolang/gno.git /tmp/gnoroot
+          GNOROOT=/tmp/gnoroot /tmp/gno test -root-dir /tmp/gnoroot -v ./gno/p/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate ./gno/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate
+          GNOROOT=/tmp/gnoroot /tmp/gno lint -root-dir /tmp/gnoroot -v ./gno/p/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate ./gno/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate
