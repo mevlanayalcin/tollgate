@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tollgate — On-Chain x402 Metering & Receipt Explorer</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <h1>Tollgate Protocol</h1>
+        <p>On-chain HTTP 402 (<code>gnolang/x402</code>) metering vaults, prepaid credit passes, subscriptions &amp; verifiable SHA-256 receipts on Gno.land</p>
+      </div>
+      <div class="badge-row">
+        <span class="badge" id="chainBadge">chain: onyx-1</span>
+        <span class="badge ok" id="statusBadge">RPC: connecting…</span>
+      </div>
+    </header>
+
+    <section class="card" style="margin-top:16px">
+      <div class="row" style="align-items:flex-end">
+        <div class="field" style="flex:1.4">
+          <label for="rpcInput">Gno RPC Endpoint (Onyx-1 or local gnodev)</label>
+          <input id="rpcInput" value="https://rpc.onyx.testnets.gno.land:443" />
+        </div>
+        <div class="field" style="flex:1.6">
+          <label for="realmInput">Tollgate Realm Path</label>
+          <input id="realmInput" value="gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate" />
+        </div>
+        <div class="field" style="flex:1.1">
+          <label for="gatewayInput">Tollgate HTTP 402 Gateway URL (optional)</label>
+          <input id="gatewayInput" value="" placeholder="Same-origin or http://127.0.0.1:8402" />
+        </div>
+        <div>
+          <button id="refreshBtn">Sync Chain</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid-stats">
+      <div class="stat"><div class="k">Vault TVL</div><div class="v" id="statTvl">—</div></div>
+      <div class="stat"><div class="k">Block Height</div><div class="v" id="statHeight">—</div></div>
+      <div class="stat"><div class="k">Services</div><div class="v" id="statServices">—</div></div>
+      <div class="stat"><div class="k">Credit Passes</div><div class="v" id="statPasses">—</div></div>
+      <div class="stat"><div class="k">Subscriptions</div><div class="v" id="statSubs">—</div></div>
+      <div class="stat"><div class="k">Verified Receipts</div><div class="v" id="statReceipts">—</div></div>
+    </section>
+
+    <section class="grid-2">
+      <div class="card">
+        <h2>Interactive HTTP 402 &amp; Dual-Rail Playground</h2>
+        <p class="muted">Probe a metered endpoint with no headers to inspect its live <code>x402 v2 PAYMENT-REQUIRED</code> offer, or attach a Tollgate Pass / Subscription header for sub-50ms metered settlement with cryptographic proof.</p>
+        <div class="row">
+          <div class="field">
+            <label for="endpointSelect">Metered Endpoint</label>
+            <select id="endpointSelect">
+              <option value="/api/v1/oracle?pair=GNOT-USD">GET /api/v1/oracle?pair=GNOT-USD</option>
+              <option value="/api/v1/weather?city=zurich">GET /api/v1/weather?city=zurich</option>
+            </select>
+          </div>
+          <div class="field" style="max-width:110px">
+            <label for="unitsInput">Units</label>
+            <input id="unitsInput" type="number" min="1" max="1000" value="10" />
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="passIdInput">X-Tollgate-Pass (optional)</label>
+            <input id="passIdInput" placeholder="e.g. 1" />
+          </div>
+          <div class="field">
+            <label for="subIdInput">X-Tollgate-Sub (optional)</label>
+            <input id="subIdInput" placeholder="e.g. 1" />
+          </div>
+        </div>
+        <div class="row">
+          <button id="probe402Btn" class="secondary">1. Probe Unpaid (402)</button>
+          <button id="callPaidBtn" class="success">2. Execute Metered Call</button>
+          <span id="httpStatusPill" class="pill" style="align-self:center"></span>
+        </div>
+        <pre id="playgroundOutput">Click "1. Probe Unpaid (402)" to inspect the live x402 v2 PAYMENT-REQUIRED header and volume discount schedule.</pre>
+      </div>
+
+      <div class="card">
+        <h2>Client-Side SHA-256 Receipt Commitment Verifier</h2>
+        <p class="muted">Recomputes the exact length-prefixed <code>tollgate-receipt-v1</code> SHA-256 digest in-browser via WebCrypto and cross-checks against the live Gno realm.</p>
+        <div class="row">
+          <div class="field">
+            <label for="lookupReceiptInput">Lookup On-Chain Receipt ID or Commitment Hash</label>
+            <input id="lookupReceiptInput" placeholder="e.g. 1 or 64-char sha256 hex" value="1" />
+          </div>
+          <div style="align-self:flex-end">
+            <button id="verifyReceiptBtn">Fetch &amp; Verify</button>
+          </div>
+        </div>
+        <pre id="verifierOutput">Enter a receipt ID or SHA-256 commitment digest to verify on-chain anchoring + local WebCrypto recomputation.</pre>
+      </div>
+    </section>
+
+    <section class="card" style="margin-top:18px">
+      <h2>Live On-Chain Service Directory</h2>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr><th>ID</th><th>Slug</th><th>Name</th><th>Unit Price</th><th>Sub Plan</th><th>Challenge</th><th>Calls</th><th>Revenue</th></tr>
+          </thead>
+          <tbody id="servicesBody">
+            <tr><td colspan="8" class="muted">Waiting for RPC sync…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

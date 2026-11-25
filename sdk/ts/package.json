@@ -1,0 +1,12 @@
+{
+  "name": "@tollgate-gno/sdk",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "TypeScript SDK for Tollgate on-chain x402 metering, credit passes, subscriptions, and SHA-256 receipt verification on Gno.land",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test src/index.test.ts"
+  }
+}
