@@ -1,7 +1,8 @@
 // Command tollgate-agent is an autonomous AI payment client and MCP tool bridge
 // that negotiates HTTP 402 (x402 v2) + Tollgate prepaid passes & subscriptions,
-// derives Rivest-Shamir PayWord SHA-256 hash-chain vouchers, verifies SHA-256
-// receipt commitments locally and on-chain, and prints audit proofs.
+// persists local PayWord SHA-256 hash-chain anchors across back-to-back calls
+// before on-chain settlement, verifies SHA-256 receipt commitments locally and
+// on-chain, and prints audit proofs.
 package main
 
 import (
@@ -14,12 +15,57 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	tollgate "github.com/mevlanayalcin/tollgate/sdk/go"
 )
+
+type agentAnchorState struct {
+	PassAnchors map[string]string `json:"passAnchors"`
+	SubAnchors  map[string]string `json:"subAnchors"`
+}
+
+func loadAgentState(path string) agentAnchorState {
+	st := agentAnchorState{
+		PassAnchors: make(map[string]string),
+		SubAnchors:  make(map[string]string),
+	}
+	if path == "" {
+		return st
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return st
+	}
+	_ = json.Unmarshal(raw, &st)
+	if st.PassAnchors == nil {
+		st.PassAnchors = make(map[string]string)
+	}
+	if st.SubAnchors == nil {
+		st.SubAnchors = make(map[string]string)
+	}
+	return st
+}
+
+func saveAgentState(path string, st agentAnchorState) {
+	if path == "" {
+		return
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0700)
+	}
+	raw, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, raw, 0600) == nil {
+		_ = os.Rename(tmp, path)
+	}
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -114,6 +160,8 @@ func runCall(args []string) {
 	nonce := fs.String("nonce", fmt.Sprintf("agent-%d", time.Now().UnixNano()), "Unique request nonce")
 	voucherKey := fs.String("voucher-key", "", "Buyer 64-char PayWord seed hex")
 	paywordDepth := fs.Int("payword-depth", 1000, "PayWord hash-chain depth")
+	stateFile := fs.String("state-file", "", "Optional JSON file persisting local PayWord anchor across calls before on-chain flush")
+	syncChain := fs.Bool("sync-chain", false, "Force re-sync PayWord anchor from on-chain realm instead of local state file")
 	_ = fs.Parse(args)
 
 	if *targetURL == "" {
@@ -121,7 +169,7 @@ func runCall(args []string) {
 		os.Exit(1)
 	}
 
-	out, err := executeAgentCall(context.Background(), *targetURL, *rpcURL, *realmPath, *passID, *subID, *units, *nonce, *voucherKey, *paywordDepth)
+	out, err := executeAgentCall(context.Background(), *targetURL, *rpcURL, *realmPath, *passID, *subID, *units, *nonce, *voucherKey, *paywordDepth, *stateFile, *syncChain)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -153,6 +201,8 @@ func executeAgentCall(
 	units int64,
 	nonce, seedHex string,
 	depth int,
+	stateFile string,
+	syncChain bool,
 ) (AgentCallReport, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	report := AgentCallReport{URL: targetURL, Nonce: nonce}
@@ -182,14 +232,7 @@ func executeAgentCall(
 	}
 	svcID, _ := strconv.ParseUint(probeResp.Header.Get(tollgate.HeaderTollgateServiceID), 10, 64)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
-	if err != nil {
-		return report, err
-	}
-	req.Header.Set(tollgate.HeaderTollgateUnits, strconv.FormatInt(units, 10))
-	req.Header.Set(tollgate.HeaderTollgateNonce, nonce)
-
-	var buyerAddr, currentAnchor string
+	var buyerAddr, chainAnchor string
 	var usedPassID uint64
 	chainID := "onyx-1"
 	payTo := ""
@@ -206,9 +249,8 @@ func executeAgentCall(
 		}
 		if sub.Active && sub.QuotaRemaining >= units {
 			report.SelectedRail = "subscription"
-			req.Header.Set(tollgate.HeaderTollgateSub, strconv.FormatUint(subID, 10))
 			buyerAddr = sub.Buyer
-			currentAnchor = sub.VoucherPubKey
+			chainAnchor = sub.VoucherPubKey
 		}
 	}
 	if report.SelectedRail == "" && passID > 0 {
@@ -217,47 +259,105 @@ func executeAgentCall(
 			return report, fmt.Errorf("query pass %d: %w", passID, err)
 		}
 		report.SelectedRail = "metered-pass"
-		req.Header.Set(tollgate.HeaderTollgatePass, strconv.FormatUint(passID, 10))
 		buyerAddr = pass.Buyer
 		usedPassID = passID
-		currentAnchor = pass.VoucherPubKey
+		chainAnchor = pass.VoucherPubKey
 	}
 	if report.SelectedRail == "" {
 		return report, fmt.Errorf("endpoint requires payment (402): supply --pass <id> or --sub <id>")
 	}
 
+	st := loadAgentState(stateFile)
+	stateKey := fmt.Sprintf("%s|%s|%d", chainID, realmPath, usedPassID)
+	if report.SelectedRail == "subscription" {
+		stateKey = fmt.Sprintf("%s|%s|%d", chainID, realmPath, subID)
+	}
+
+	activeAnchor := chainAnchor
+	usedLocalAnchor := false
+	if !syncChain && stateFile != "" {
+		if report.SelectedRail == "subscription" && st.SubAnchors[stateKey] != "" {
+			activeAnchor = st.SubAnchors[stateKey]
+			usedLocalAnchor = true
+		} else if report.SelectedRail == "metered-pass" && st.PassAnchors[stateKey] != "" {
+			activeAnchor = st.PassAnchors[stateKey]
+			usedLocalAnchor = true
+		}
+	}
+
 	parsedURL, _ := url.Parse(targetURL)
 	expectedResHash := tollgate.HashResource("GET " + parsedURL.RequestURI())
 
-	if strings.TrimSpace(seedHex) != "" && currentAnchor != "" {
+	var pwChain *tollgate.PayWordChain
+	if strings.TrimSpace(seedHex) != "" && activeAnchor != "" {
 		if depth <= 0 {
 			depth = 1000
 		}
-		ch, err := tollgate.BuildPayWordChain(chainID, strings.TrimSpace(seedHex), depth)
+		pwChain, err = tollgate.BuildPayWordChain(chainID, strings.TrimSpace(seedHex), depth)
 		if err != nil {
 			return report, err
 		}
-		proofHex, _, err := ch.ProofForAnchor(currentAnchor, units)
-		if err != nil {
-			return report, err
-		}
-		req.Header.Set(tollgate.HeaderTollgateVoucherSig, proofHex)
-		report.VoucherProofHex = proofHex
 	}
 
-	resp, err := client.Do(req)
+	doRequest := func(anchor string) (*http.Response, []byte, string, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		req.Header.Set(tollgate.HeaderTollgateUnits, strconv.FormatInt(units, 10))
+		req.Header.Set(tollgate.HeaderTollgateNonce, nonce)
+		if report.SelectedRail == "subscription" {
+			req.Header.Set(tollgate.HeaderTollgateSub, strconv.FormatUint(subID, 10))
+		} else {
+			req.Header.Set(tollgate.HeaderTollgatePass, strconv.FormatUint(usedPassID, 10))
+		}
+		var proofHex string
+		if pwChain != nil && anchor != "" {
+			proofHex, _, err = pwChain.ProofForAnchor(anchor, units)
+			if err != nil {
+				return nil, nil, "", err
+			}
+			req.Header.Set(tollgate.HeaderTollgateVoucherSig, proofHex)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, nil, proofHex, err
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp, body, proofHex, nil
+	}
+
+	resp, body, proofHex, err := doRequest(activeAnchor)
 	if err != nil {
 		return report, err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	// If local cached anchor drifted from chain (e.g. another client settled), re-sync once from chain
+	if resp.StatusCode == http.StatusUnauthorized && usedLocalAnchor && chainAnchor != "" && chainAnchor != activeAnchor {
+		resp, body, proofHex, err = doRequest(chainAnchor)
+		if err != nil {
+			return report, err
+		}
+	}
+
 	report.FinalStatus = resp.StatusCode
+	report.VoucherProofHex = proofHex
 	if json.Valid(body) {
 		report.ResponseBody = json.RawMessage(body)
 	}
 	report.ResourceHash = resp.Header.Get(tollgate.HeaderTollgateResHash)
 	report.ReceiptCommitment = resp.Header.Get(tollgate.HeaderTollgateCommitment)
 	report.NetUgnot, _ = strconv.ParseInt(resp.Header.Get(tollgate.HeaderTollgateNetUgnot), 10, 64)
+
+	// Advance persisted local anchor ONLY on HTTP 200 OK
+	if resp.StatusCode == http.StatusOK && proofHex != "" && stateFile != "" {
+		if report.SelectedRail == "subscription" {
+			st.SubAnchors[stateKey] = proofHex
+		} else {
+			st.PassAnchors[stateKey] = proofHex
+		}
+		saveAgentState(stateFile, st)
+	}
 
 	report.LocalProofVerified = resp.StatusCode == http.StatusOK &&
 		report.ResourceHash == expectedResHash &&
@@ -305,6 +405,7 @@ func runMCP(args []string) {
 	realmPath := fs.String("realm", "", "Tollgate realm path")
 	defaultSeed := fs.String("voucher-key", "", "Default PayWord 64-char seed hex")
 	defaultDepth := fs.Int("payword-depth", 1000, "Default PayWord chain depth")
+	stateFile := fs.String("state-file", "", "Optional JSON file persisting local PayWord anchor across MCP calls")
 	_ = fs.Parse(args)
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -376,7 +477,7 @@ func runMCP(args []string) {
 				if unitsF < 1 {
 					unitsF = 1
 				}
-				rep, err := executeAgentCall(context.Background(), u, *rpcURL, *realmPath, uint64(pidF), uint64(sidF), int64(unitsF), fmt.Sprintf("mcp-%d", time.Now().UnixNano()), vKey, *defaultDepth)
+				rep, err := executeAgentCall(context.Background(), u, *rpcURL, *realmPath, uint64(pidF), uint64(sidF), int64(unitsF), fmt.Sprintf("mcp-%d", time.Now().UnixNano()), vKey, *defaultDepth, *stateFile, false)
 				text, _ := json.Marshal(rep)
 				if err != nil {
 					text = []byte(err.Error())

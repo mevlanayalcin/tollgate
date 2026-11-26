@@ -32,7 +32,7 @@ func main() {
 	unitPrice := flag.Int64("unit-price", 1000, "Unit price in ugnot")
 	webDir := flag.String("web", "web", "Static web playground directory")
 	stateFile := flag.String("state-file", "", "Optional JSON file to persist used nonces and unsettled receipts")
-	requireAuth := flag.Bool("require-auth", true, "Require Ed25519 buyer voucher signatures on pass and subscription rails")
+	requireAuth := flag.Bool("require-auth", true, "Require PayWord SHA-256 hash-chain buyer voucher proofs on pass and subscription rails")
 	autoSettle := flag.Duration("auto-settle", 15*time.Second, "Background on-chain settlement flush interval when settler is configured (0 disables timer)")
 	adminToken := flag.String("admin-token", "", "Optional bearer token for /api/settle-now and /api/explorer/pending-receipts (when empty, restricted to loopback callers)")
 	gnokeyBin := flag.String("gnokey-bin", "", "Path to gnokey binary to enable on-chain settlement submission")

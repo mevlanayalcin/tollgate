@@ -13,10 +13,14 @@ R_PATH="gno.land/r/${ADDR}/tollgate/v2"
 echo "=== 1. Verify /r/tollgate/v2 is live on onyx-1 RPC ==="
 "$BIN/gnokey" query "vm/qfile" -data "$R_PATH" -remote "$RPC"
 
-echo "=== 2. Generate PayWord SHA-256 chain & seed live service, pass, subscription, and verified receipts ==="
-KP_JSON=$("$ROOT/bin/tollgate-agent" keygen --chain-id "$CHAIN_ID" --depth 1000)
-PW_ANCHOR=$(echo "$KP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['anchorHex'])")
-PW_SEED=$(echo "$KP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['seedHex'])")
+echo "=== 2. Generate SEPARATE PayWord SHA-256 chains for pass & subscription ==="
+PASS_KP=$("$ROOT/bin/tollgate-agent" keygen --chain-id "$CHAIN_ID" --depth 1000)
+PASS_ANCHOR=$(echo "$PASS_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)[anchorHex])")
+PASS_SEED=$(echo "$PASS_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)[seedHex])")
+
+SUB_KP=$("$ROOT/bin/tollgate-agent" keygen --chain-id "$CHAIN_ID" --depth 1000)
+SUB_ANCHOR=$(echo "$SUB_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)[anchorHex])")
+SUB_SEED=$(echo "$SUB_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)[seedHex])")
 
 printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
   -home "$KEYHOME" -insecure-password-stdin \
@@ -37,7 +41,7 @@ printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
   -gas-fee 1000000ugnot -gas-wanted 20000000 \
   -send 50000ugnot \
   -pkgpath "$R_PATH" -func OpenPass \
-  -args "1" -args "2000" -args "5000" -args "$PW_ANCHOR"
+  -args "1" -args "2000" -args "5000" -args "$PASS_ANCHOR"
 sleep 5
 
 printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
@@ -46,12 +50,12 @@ printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
   -gas-fee 1000000ugnot -gas-wanted 20000000 \
   -send 10000ugnot \
   -pkgpath "$R_PATH" -func Subscribe \
-  -args "1" -args "$PW_ANCHOR"
+  -args "1" -args "$SUB_ANCHOR"
 sleep 5
 
 RES_HASH=$(python3 -c "import hashlib; print(hashlib.sha256(b'GET /api/v1/oracle?pair=GNOT-USD').hexdigest())")
-PASS_PROOF=$("$ROOT/bin/tollgate-agent" payword-proof --seed "$PW_SEED" --chain-id "$CHAIN_ID" --depth 1000 --anchor "$PW_ANCHOR" --units 10)
-SUB_PROOF=$("$ROOT/bin/tollgate-agent" payword-proof --seed "$PW_SEED" --chain-id "$CHAIN_ID" --depth 1000 --anchor "$PW_ANCHOR" --units 2)
+PASS_PROOF=$("$ROOT/bin/tollgate-agent" payword-proof --seed "$PASS_SEED" --chain-id "$CHAIN_ID" --depth 1000 --anchor "$PASS_ANCHOR" --units 10)
+SUB_PROOF=$("$ROOT/bin/tollgate-agent" payword-proof --seed "$SUB_SEED" --chain-id "$CHAIN_ID" --depth 1000 --anchor "$SUB_ANCHOR" --units 2)
 
 printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
   -home "$KEYHOME" -insecure-password-stdin \

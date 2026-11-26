@@ -255,3 +255,192 @@ func TestFlushSettlementsDeadLetterDoesNotBlockQueue(t *testing.T) {
 		t.Fatalf("expected dead-lettered receipt skipped on retry: settled2=%d err2=%v calls=%d", settled2, err2, sub.calls)
 	}
 }
+
+// Fable 5.2 PayWord concurrency & failure regression tests:
+
+func TestPayWordConcurrentRequestsPreserveChainOrder(t *testing.T) {
+	seed := HashResource("tollgate-concurrent-seed")
+	pw, _ := BuildPayWordChain("onyx-1", seed, 50)
+	anchor := pw.AnchorHex()
+	proof1, _, _ := pw.ProofForAnchor(anchor, 2)
+	proof2, _, _ := pw.ProofForAnchor(proof1, 3)
+
+	fc := &fakeChain{
+		pass: PassInfo{
+			ID: 1, ServiceID: 1, Buyer: "g1buyer000000000000000000000000000000000",
+			AvailableUgnot: 50000, MaxPerCallUgnot: 2000, ExpiryHeight: 500, CurrentHeight: 100,
+			VoucherPubKey: anchor,
+		},
+	}
+	subm := &fakeSubmitter{}
+	mw := NewMiddleware(MiddlewareConfig{
+		ChainID: "onyx-1", RealmPath: "gno.land/r/test/tollgate/v2",
+		Chain: fc, Submitter: subm, RequireAuth: true,
+		Routes: map[string]RouteSpec{
+			"GET /v1/slow": {ServiceID: 1, Slug: "s", PayTo: "g1prov0000000000000000000000000000000000", UnitPriceUgnot: 1000},
+		},
+	})
+
+	started1 := make(chan struct{})
+	h := mw.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(HeaderTollgateNonce) == "c-1" {
+			close(started1)
+			// Slow down request #1 so an unlocked implementation would finish #2 first
+			select {
+			case <-r.Context().Done():
+			case <-make(chan struct{}):
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	_ = h
+	// Deterministic version with short sleep so request #1 runs slower than #2
+	entered1 := make(chan struct{})
+	h2 := mw.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(HeaderTollgateNonce) == "c-1" {
+			close(entered1)
+			// Sleep briefly while #2 waits on the per-pass mutex
+			ctx, cancel := context.WithTimeout(r.Context(), 40_000_000) // 40ms
+			defer cancel()
+			<-ctx.Done()
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+
+	done1 := make(chan int, 1)
+	done2 := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/v1/slow", nil)
+		req.Header.Set(HeaderTollgatePass, "1")
+		req.Header.Set(HeaderTollgateUnits, "2")
+		req.Header.Set(HeaderTollgateNonce, "c-1")
+		req.Header.Set(HeaderTollgateVoucherSig, proof1)
+		rec := httptest.NewRecorder()
+		h2.ServeHTTP(rec, req)
+		done1 <- rec.Code
+	}()
+	<-entered1
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/v1/slow", nil)
+		req.Header.Set(HeaderTollgatePass, "1")
+		req.Header.Set(HeaderTollgateUnits, "3")
+		req.Header.Set(HeaderTollgateNonce, "c-2")
+		req.Header.Set(HeaderTollgateVoucherSig, proof2)
+		rec := httptest.NewRecorder()
+		h2.ServeHTTP(rec, req)
+		done2 <- rec.Code
+	}()
+
+	if c1, c2 := <-done1, <-done2; c1 != 200 || c2 != 200 {
+		t.Fatalf("expected both concurrent calls 200, got c1=%d c2=%d", c1, c2)
+	}
+	n, err := mw.FlushSettlements(context.Background())
+	if err != nil || n != 2 || len(subm.submitted) != 2 {
+		t.Fatalf("flush failed: n=%d err=%v", n, err)
+	}
+	if subm.submitted[0].Nonce != "c-1" || subm.submitted[1].Nonce != "c-2" {
+		t.Fatalf("expected chain order c-1 then c-2, got %s then %s", subm.submitted[0].Nonce, subm.submitted[1].Nonce)
+	}
+}
+
+func TestPayWord5xxRollbackRestoresAnchorForRetry(t *testing.T) {
+	seed := HashResource("tollgate-rollback-seed")
+	pw, _ := BuildPayWordChain("onyx-1", seed, 50)
+	anchor := pw.AnchorHex()
+	proof1, _, _ := pw.ProofForAnchor(anchor, 2)
+
+	fc := &fakeChain{
+		pass: PassInfo{
+			ID: 1, ServiceID: 1, Buyer: "g1buyer000000000000000000000000000000000",
+			AvailableUgnot: 50000, MaxPerCallUgnot: 2000, ExpiryHeight: 500, CurrentHeight: 100,
+			VoucherPubKey: anchor,
+		},
+	}
+	mw := NewMiddleware(MiddlewareConfig{
+		ChainID: "onyx-1", RealmPath: "gno.land/r/test/tollgate/v2",
+		Chain: fc, RequireAuth: true,
+		Routes: map[string]RouteSpec{
+			"GET /v1/flaky": {ServiceID: 1, Slug: "f", PayTo: "g1prov0000000000000000000000000000000000", UnitPriceUgnot: 1000},
+		},
+	})
+	failFirst := true
+	h := mw.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failFirst {
+			failFirst = false
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/flaky", nil)
+	req1.Header.Set(HeaderTollgatePass, "1")
+	req1.Header.Set(HeaderTollgateUnits, "2")
+	req1.Header.Set(HeaderTollgateNonce, "rb-1")
+	req1.Header.Set(HeaderTollgateVoucherSig, proof1)
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, req1)
+	if rec1.Code != 500 {
+		t.Fatalf("expected 500, got %d", rec1.Code)
+	}
+
+	// Retry with same proof1 MUST succeed because 500 rolled back anchor & nonce
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/flaky", nil)
+	req2.Header.Set(HeaderTollgatePass, "1")
+	req2.Header.Set(HeaderTollgateUnits, "2")
+	req2.Header.Set(HeaderTollgateNonce, "rb-1")
+	req2.Header.Set(HeaderTollgateVoucherSig, proof1)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != 200 {
+		t.Fatalf("expected retry 200 after rollback, got %d (%s)", rec2.Code, rec2.Body.String())
+	}
+}
+
+type flakyTransientSubmitter struct {
+	failTimes int
+	calls     int
+	settled   []string
+}
+
+func (f *flakyTransientSubmitter) SubmitReceipt(_ context.Context, r PendingReceipt) (string, error) {
+	f.calls++
+	if f.calls <= f.failTimes {
+		return "", errors.New("rpc dial timeout")
+	}
+	f.settled = append(f.settled, r.Nonce)
+	return "tx-" + r.Nonce, nil
+}
+
+func TestPayWordTransientRPCOutageDoesNotDeadLetterChain(t *testing.T) {
+	sub := &flakyTransientSubmitter{failTimes: 4}
+	mw := NewMiddleware(MiddlewareConfig{
+		ChainID: "onyx-1", RealmPath: "gno.land/r/test/tollgate/v2",
+		Submitter: sub,
+	})
+	mw.mu.Lock()
+	mw.receipts = []PendingReceipt{
+		{Rail: "metered-pass", PassID: 1, Units: 2, AmountUgnot: 2000, Nonce: "t-1", BuyerSigHex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		{Rail: "metered-pass", PassID: 1, Units: 3, AmountUgnot: 3000, Nonce: "t-2", BuyerSigHex: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+	}
+	mw.mu.Unlock()
+
+	// 4 consecutive transient outages (>3 attempts!) must NOT dead-letter PayWord receipts or settle t-2 out of order!
+	for i := 0; i < 4; i++ {
+		n, err := mw.FlushSettlements(context.Background())
+		if err == nil || n != 0 {
+			t.Fatalf("tick %d: expected transient err and 0 settled, got n=%d err=%v", i, n, err)
+		}
+		recs := mw.Receipts()
+		if recs[0].DeadLetter || recs[1].DeadLetter || len(sub.settled) != 0 {
+			t.Fatalf("tick %d: PayWord chain must never dead-letter on transient RPC error: %+v", i, recs)
+		}
+	}
+
+	// On recovery, BOTH t-1 and t-2 settle cleanly in exact order!
+	n, err := mw.FlushSettlements(context.Background())
+	if err != nil || n != 2 || len(sub.settled) != 2 || sub.settled[0] != "t-1" || sub.settled[1] != "t-2" {
+		t.Fatalf("recovery flush failed: n=%d err=%v settled=%v", n, err, sub.settled)
+	}
+}

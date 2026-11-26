@@ -11,9 +11,9 @@ import (
 	"log"
 	"math"
 	"net/http"
-	"strings"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -57,14 +57,14 @@ type SettlementSubmitter interface {
 }
 
 type MiddlewareConfig struct {
-	ChainID       string
-	RealmPath     string
-	Chain         ChainReader
-	Facilitator   Facilitator
-	Submitter     SettlementSubmitter
-	StateFile     string // optional JSON persistence for nonces & unsettled receipts
-	RequireAuth   bool   // when true, reject passes/subs lacking VoucherPubKey
-	Routes        map[string]RouteSpec
+	ChainID     string
+	RealmPath   string
+	Chain       ChainReader
+	Facilitator Facilitator
+	Submitter   SettlementSubmitter
+	StateFile   string // optional JSON persistence for nonces, anchors & unsettled receipts
+	RequireAuth bool   // when true, reject passes/subs lacking a PayWord SHA-256 voucher root
+	Routes      map[string]RouteSpec
 }
 
 type persistedState struct {
@@ -75,10 +75,12 @@ type persistedState struct {
 }
 
 type Middleware struct {
-	cfg           MiddlewareConfig
-	mu            sync.Mutex
-	flushMu       sync.Mutex
-	usedNonces    map[string]bool
+	cfg             MiddlewareConfig
+	mu              sync.Mutex
+	flushMu         sync.Mutex
+	passLocks       map[uint64]*sync.Mutex
+	subLocks        map[uint64]*sync.Mutex
+	usedNonces      map[string]bool
 	localDebits     map[uint64]int64
 	localSubUsage   map[uint64]int64
 	localPassAnchor map[uint64]string
@@ -88,8 +90,10 @@ type Middleware struct {
 
 func NewMiddleware(cfg MiddlewareConfig) *Middleware {
 	m := &Middleware{
-		cfg:           cfg,
-		usedNonces:    make(map[string]bool),
+		cfg:             cfg,
+		passLocks:       make(map[uint64]*sync.Mutex),
+		subLocks:        make(map[uint64]*sync.Mutex),
+		usedNonces:      make(map[string]bool),
 		localDebits:     make(map[uint64]int64),
 		localSubUsage:   make(map[uint64]int64),
 		localPassAnchor: make(map[uint64]string),
@@ -97,6 +101,34 @@ func NewMiddleware(cfg MiddlewareConfig) *Middleware {
 	}
 	m.loadState()
 	return m
+}
+
+// lockPass serializes reserve -> handler -> receipt/rollback for a single passID
+// so PayWord hash-chain proofs always append and settle strictly in chain order,
+// while distinct passes remain fully concurrent.
+func (m *Middleware) lockPass(passID uint64) *sync.Mutex {
+	m.mu.Lock()
+	lk := m.passLocks[passID]
+	if lk == nil {
+		lk = &sync.Mutex{}
+		m.passLocks[passID] = lk
+	}
+	m.mu.Unlock()
+	lk.Lock()
+	return lk
+}
+
+// lockSub serializes reserve -> handler -> receipt/rollback for a single subID.
+func (m *Middleware) lockSub(subID uint64) *sync.Mutex {
+	m.mu.Lock()
+	lk := m.subLocks[subID]
+	if lk == nil {
+		lk = &sync.Mutex{}
+		m.subLocks[subID] = lk
+	}
+	m.mu.Unlock()
+	lk.Lock()
+	return lk
 }
 
 func (m *Middleware) loadState() {
@@ -145,6 +177,7 @@ func (m *Middleware) saveStateLocked() {
 		LocalSubAnchor:  m.localSubAnchor,
 	}, "", "  ")
 	if err != nil {
+		log.Printf("tollgate: state marshal error: %v", err)
 		return
 	}
 	tmp := m.cfg.StateFile + ".tmp"
@@ -165,8 +198,6 @@ func (m *Middleware) Receipts() []PendingReceipt {
 	return out
 }
 
-// FlushSettlements submits all unsettled receipts on-chain via cfg.Submitter and
-// reconciles localDebits / localSubUsage once confirmed on-chain.
 func isPermanentSettlementError(err error) bool {
 	if err == nil {
 		return false
@@ -183,8 +214,24 @@ func isPermanentSettlementError(err error) bool {
 	return false
 }
 
-// FlushSettlements serializes on-chain settlement submission, skips dead-lettered
-// receipts, and continues past individual errors so one bad receipt never stalls the queue.
+func isTerminalChainError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, pat := range []string{"expired", "is closed", "not found"} {
+		if strings.Contains(msg, pat) {
+			return true
+		}
+	}
+	return false
+}
+
+// FlushSettlements submits unsettled receipts in strict chain order per pass/sub.
+// Transient RPC errors pause only that pass/sub for retry on the next tick (never
+// dead-lettering a live PayWord chain). Permanent errors reconcile against the live
+// on-chain anchor (recovering from crash-duplicate nonces or dead-lettering terminal
+// expired/closed passes cleanly without blocking other passes).
 func (m *Middleware) FlushSettlements(ctx context.Context) (int, error) {
 	if m.cfg.Submitter == nil {
 		return 0, nil
@@ -203,6 +250,9 @@ func (m *Middleware) FlushSettlements(ctx context.Context) (int, error) {
 
 	settledCount := 0
 	var firstErr error
+	pausedPass := make(map[uint64]bool)
+	pausedSub := make(map[uint64]bool)
+
 	for _, idx := range todo {
 		m.mu.Lock()
 		if m.receipts[idx].Settled || m.receipts[idx].DeadLetter {
@@ -212,27 +262,90 @@ func (m *Middleware) FlushSettlements(ctx context.Context) (int, error) {
 		rec := m.receipts[idx]
 		m.mu.Unlock()
 
+		if rec.Rail == "metered-pass" && pausedPass[rec.PassID] {
+			continue
+		}
+		if rec.Rail == "subscription" && pausedSub[rec.SubID] {
+			continue
+		}
+
 		txHash, err := m.cfg.Submitter.SubmitReceipt(ctx, rec)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
+			perm := isPermanentSettlementError(err)
+
+			// Crash-recovery check: if an already-broadcast PayWord receipt returns
+			// "already used" / "invalid payword", verify whether on-chain state already
+			// moved to rec.BuyerSigHex (or whether the chain diverged).
+			recovered := false
+			if perm && m.cfg.Chain != nil && rec.BuyerSigHex != "" {
+				if rec.Rail == "metered-pass" && rec.PassID > 0 {
+					if p, cerr := m.cfg.Chain.Pass(ctx, rec.PassID); cerr == nil {
+						if p.VoucherPubKey == rec.BuyerSigHex {
+							recovered = true
+						} else if !isTerminalChainError(err) {
+							m.reconcilePassAnchorLocked(rec.PassID, p.VoucherPubKey)
+						}
+					}
+				} else if rec.Rail == "subscription" && rec.SubID > 0 {
+					if s, cerr := m.cfg.Chain.Subscription(ctx, rec.SubID); cerr == nil {
+						if s.VoucherPubKey == rec.BuyerSigHex {
+							recovered = true
+						} else if !isTerminalChainError(err) {
+							m.reconcileSubAnchorLocked(rec.SubID, s.VoucherPubKey)
+						}
+					}
+				}
+			}
+
+			if recovered {
+				m.mu.Lock()
+				if !m.receipts[idx].Settled {
+					m.receipts[idx].Settled = true
+					m.receipts[idx].LastError = ""
+					m.releaseReservationLocked(rec)
+					m.saveStateLocked()
+					settledCount++
+				}
+				m.mu.Unlock()
+				continue
+			}
+
 			m.mu.Lock()
 			m.receipts[idx].Attempts++
 			m.receipts[idx].LastError = err.Error()
-			if m.receipts[idx].Attempts >= 3 || isPermanentSettlementError(err) {
+
+			// Never dead-letter a PayWord receipt on transient RPC/network errors;
+			// pause this pass/sub for the current flush so chain ordering stays intact.
+			isPayWordRail := (rec.Rail == "metered-pass" || rec.Rail == "subscription") && rec.BuyerSigHex != ""
+			shouldDeadLetter := perm || (!isPayWordRail && m.receipts[idx].Attempts >= 3)
+
+			if shouldDeadLetter {
 				m.receipts[idx].DeadLetter = true
-				if rec.Rail == "metered-pass" && m.localDebits[rec.PassID] >= rec.AmountUgnot {
-					m.localDebits[rec.PassID] -= rec.AmountUgnot
+				m.releaseReservationLocked(rec)
+				if isTerminalChainError(err) {
+					// If pass/sub is closed or expired, clear local anchor & dead-letter
+					// any remaining queued receipts for the same pass/sub.
+					if rec.Rail == "metered-pass" {
+						delete(m.localPassAnchor, rec.PassID)
+					} else if rec.Rail == "subscription" {
+						delete(m.localSubAnchor, rec.SubID)
+					}
 				}
-				if rec.Rail == "subscription" && m.localSubUsage[rec.SubID] >= rec.Units {
-					m.localSubUsage[rec.SubID] -= rec.Units
+			} else {
+				if rec.Rail == "metered-pass" {
+					pausedPass[rec.PassID] = true
+				} else if rec.Rail == "subscription" {
+					pausedSub[rec.SubID] = true
 				}
 			}
 			m.saveStateLocked()
 			m.mu.Unlock()
 			continue
 		}
+
 		m.mu.Lock()
 		if !m.receipts[idx].Settled {
 			m.receipts[idx].Settled = true
@@ -240,18 +353,44 @@ func (m *Middleware) FlushSettlements(ctx context.Context) (int, error) {
 			if txHash != "" {
 				m.receipts[idx].TxHash = txHash
 			}
-			if rec.Rail == "metered-pass" && m.localDebits[rec.PassID] >= rec.AmountUgnot {
-				m.localDebits[rec.PassID] -= rec.AmountUgnot
-			}
-			if rec.Rail == "subscription" && m.localSubUsage[rec.SubID] >= rec.Units {
-				m.localSubUsage[rec.SubID] -= rec.Units
-			}
+			m.releaseReservationLocked(rec)
 			m.saveStateLocked()
 			settledCount++
 		}
 		m.mu.Unlock()
 	}
 	return settledCount, firstErr
+}
+
+func (m *Middleware) releaseReservationLocked(rec PendingReceipt) {
+	if rec.Rail == "metered-pass" && m.localDebits[rec.PassID] >= rec.AmountUgnot {
+		m.localDebits[rec.PassID] -= rec.AmountUgnot
+	}
+	if rec.Rail == "subscription" && m.localSubUsage[rec.SubID] >= rec.Units {
+		m.localSubUsage[rec.SubID] -= rec.Units
+	}
+}
+
+func (m *Middleware) reconcilePassAnchorLocked(passID uint64, chainAnchor string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if chainAnchor == "" {
+		delete(m.localPassAnchor, passID)
+	} else {
+		m.localPassAnchor[passID] = chainAnchor
+	}
+	m.saveStateLocked()
+}
+
+func (m *Middleware) reconcileSubAnchorLocked(subID uint64, chainAnchor string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if chainAnchor == "" {
+		delete(m.localSubAnchor, subID)
+	} else {
+		m.localSubAnchor[subID] = chainAnchor
+	}
+	m.saveStateLocked()
 }
 
 type bufferedResponse struct {
@@ -295,9 +434,12 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 
 		units := int64(1)
 		if rawUnits := r.Header.Get(HeaderTollgateUnits); rawUnits != "" {
-			if parsed, err := strconv.ParseInt(rawUnits, 10, 64); err == nil && parsed > 0 && parsed <= 10000 {
-				units = parsed
+			parsed, err := strconv.ParseInt(rawUnits, 10, 64)
+			if err != nil || parsed <= 0 || parsed > MaxPayWordSteps {
+				http.Error(w, fmt.Sprintf(`{"error":"X-Tollgate-Units must be between 1 and %d"}`, MaxPayWordSteps), http.StatusBadRequest)
+				return
 			}
+			units = parsed
 		}
 
 		nonce := r.Header.Get(HeaderTollgateNonce)
@@ -311,7 +453,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		resDescriptor := r.Method + " " + r.URL.RequestURI()
 		resHash := HashResource(resDescriptor)
 
-		// Rail 1: Subscription fast-path (Ed25519 voucher authenticated)
+		// Rail 1: Subscription fast-path (PayWord SHA-256 hash-chain authenticated)
 		if rawSub := r.Header.Get(HeaderTollgateSub); rawSub != "" {
 			subID, err := strconv.ParseUint(rawSub, 10, 64)
 			if err != nil || subID == 0 {
@@ -322,7 +464,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			return
 		}
 
-		// Rail 2: Prepaid Credit Pass fast-path (Ed25519 voucher authenticated)
+		// Rail 2: Prepaid Credit Pass fast-path (PayWord SHA-256 hash-chain authenticated)
 		if rawPass := r.Header.Get(HeaderTollgatePass); rawPass != "" {
 			passID, err := strconv.ParseUint(rawPass, 10, 64)
 			if err != nil || passID == 0 {
@@ -357,6 +499,11 @@ func (m *Middleware) handleSubscription(
 		m.write402(w, r, spec, units, nonce, "chain reader unavailable")
 		return
 	}
+
+	// Serialize per subID across reserve -> handler -> receipt/rollback
+	subLk := m.lockSub(subID)
+	defer subLk.Unlock()
+
 	sub, err := m.cfg.Chain.Subscription(r.Context(), subID)
 	if err != nil || !sub.Active || sub.ServiceID != spec.ServiceID {
 		m.write402(w, r, spec, units, nonce, "subscription inactive or wrong service")
@@ -371,7 +518,6 @@ func (m *Middleware) handleSubscription(
 		return
 	}
 
-	// Atomic quota + nonce + PayWord anchor reservation
 	nKey := strconv.FormatUint(spec.ServiceID, 10) + ":" + nonce
 	m.mu.Lock()
 	if m.usedNonces[nKey] {
@@ -418,7 +564,8 @@ func (m *Middleware) handleSubscription(
 	if buf.code >= 400 {
 		m.mu.Lock()
 		m.localSubUsage[subID] -= units
-		if advancedSubAnchor && m.localSubAnchor[subID] == buyerSig {
+		delete(m.usedNonces, nKey)
+		if advancedSubAnchor {
 			if prevSubAnchor == "" {
 				delete(m.localSubAnchor, subID)
 			} else {
@@ -441,7 +588,6 @@ func (m *Middleware) handleSubscription(
 		Buyer:        sub.Buyer,
 		Provider:     spec.PayTo,
 		Units:        units,
-		AmountUgnot:  0,
 		Nonce:        nonce,
 		ResourceHash: resHash,
 		Commitment:   commitment,
@@ -451,12 +597,13 @@ func (m *Middleware) handleSubscription(
 	m.saveStateLocked()
 	m.mu.Unlock()
 
-	buf.header.Set(HeaderTollgateRail, "subscription")
-	buf.header.Set(HeaderTollgateServiceID, strconv.FormatUint(spec.ServiceID, 10))
-	buf.header.Set(HeaderTollgateNonce, nonce)
-	buf.header.Set(HeaderTollgateResHash, resHash)
-	buf.header.Set(HeaderTollgateCommitment, commitment)
-	buf.header.Set(HeaderTollgateNetUgnot, "0")
+	buf.Header().Set(HeaderTollgateRail, "subscription")
+	buf.Header().Set(HeaderTollgateServiceID, strconv.FormatUint(spec.ServiceID, 10))
+	buf.Header().Set(HeaderTollgateRealm, m.cfg.RealmPath)
+	buf.Header().Set(HeaderTollgateNonce, nonce)
+	buf.Header().Set(HeaderTollgateResHash, resHash)
+	buf.Header().Set(HeaderTollgateNetUgnot, "0")
+	buf.Header().Set(HeaderTollgateCommitment, commitment)
 	buf.flushTo(w)
 }
 
@@ -474,6 +621,11 @@ func (m *Middleware) handlePass(
 		m.write402(w, r, spec, units, nonce, "chain reader unavailable")
 		return
 	}
+
+	// Serialize per passID across reserve -> handler -> receipt/rollback
+	passLk := m.lockPass(passID)
+	defer passLk.Unlock()
+
 	pass, err := m.cfg.Chain.Pass(r.Context(), passID)
 	if err != nil || pass.Closed || pass.ServiceID != spec.ServiceID {
 		m.write402(w, r, spec, units, nonce, "credit pass not found, closed, or wrong service")
@@ -502,7 +654,6 @@ func (m *Middleware) handlePass(
 		return
 	}
 
-	// Atomic balance + nonce + PayWord anchor reservation (race-free)
 	nKey := strconv.FormatUint(spec.ServiceID, 10) + ":" + nonce
 	m.mu.Lock()
 	if m.usedNonces[nKey] {
@@ -549,7 +700,8 @@ func (m *Middleware) handlePass(
 	if buf.code >= 400 {
 		m.mu.Lock()
 		m.localDebits[passID] -= charge.NetUgnot
-		if advancedPassAnchor && m.localPassAnchor[passID] == buyerSig {
+		delete(m.usedNonces, nKey)
+		if advancedPassAnchor {
 			if prevPassAnchor == "" {
 				delete(m.localPassAnchor, passID)
 			} else {
@@ -565,7 +717,6 @@ func (m *Middleware) handlePass(
 		m.cfg.ChainID, spec.ServiceID, passID, pass.Buyer, spec.PayTo,
 		units, charge.NetUgnot, nonce, resHash,
 	)
-
 	m.mu.Lock()
 	m.receipts = append(m.receipts, PendingReceipt{
 		Rail:         "metered-pass",
@@ -586,12 +737,13 @@ func (m *Middleware) handlePass(
 	m.saveStateLocked()
 	m.mu.Unlock()
 
-	buf.header.Set(HeaderTollgateRail, "metered-pass")
-	buf.header.Set(HeaderTollgateServiceID, strconv.FormatUint(spec.ServiceID, 10))
-	buf.header.Set(HeaderTollgateNonce, nonce)
-	buf.header.Set(HeaderTollgateResHash, resHash)
-	buf.header.Set(HeaderTollgateCommitment, commitment)
-	buf.header.Set(HeaderTollgateNetUgnot, strconv.FormatInt(charge.NetUgnot, 10))
+	buf.Header().Set(HeaderTollgateRail, "metered-pass")
+	buf.Header().Set(HeaderTollgateServiceID, strconv.FormatUint(spec.ServiceID, 10))
+	buf.Header().Set(HeaderTollgateRealm, m.cfg.RealmPath)
+	buf.Header().Set(HeaderTollgateNonce, nonce)
+	buf.Header().Set(HeaderTollgateResHash, resHash)
+	buf.Header().Set(HeaderTollgateNetUgnot, strconv.FormatInt(charge.NetUgnot, 10))
+	buf.Header().Set(HeaderTollgateCommitment, commitment)
 	buf.flushTo(w)
 }
 
@@ -601,28 +753,36 @@ func (m *Middleware) handleX402(
 	next http.Handler,
 	spec RouteSpec,
 	units int64,
-	fallbackNonce string,
+	nonce string,
 	resHash string,
-	sigHeader string,
+	paymentSigHeader string,
 ) {
 	if m.cfg.Facilitator == nil {
-		m.write402(w, r, spec, units, fallbackNonce, "x402 facilitator not configured")
+		m.write402(w, r, spec, units, nonce, "x402 facilitator not configured")
+		return
+	}
+	charge, err := ComputeCharge(spec.UnitPriceUgnot, units)
+	if err != nil {
+		http.Error(w, `{"error":"invalid units"}`, http.StatusBadRequest)
 		return
 	}
 
-	// Stock x402 interop fix: extract accepted.extra.memo from PAYMENT-SIGNATURE
-	// so stock @gnolang/x402 & Go clients do NOT hit memo_mismatch!
-	nonce := fallbackNonce
-	if extractedMemo, ok := ExtractX402AcceptedMemo(sigHeader); ok {
-		parsedSvc, parsedNonce, valid := ParseInvoiceMemo(extractedMemo)
-		if !valid || parsedSvc != spec.ServiceID {
-			m.write402(w, r, spec, units, fallbackNonce, "x402 invoice memo does not match service")
-			return
+	// Stock x402 client interop: if X-Tollgate-Nonce wasn't explicitly sent,
+	// recover the invoice nonce from accepted.extra.memo in PAYMENT-SIGNATURE.
+	if r.Header.Get(HeaderTollgateNonce) == "" {
+		if memo, ok := ExtractX402AcceptedMemo(paymentSigHeader); ok && memo != "" {
+			if svcID, parsedNonce, ok := ParseInvoiceMemo(memo); ok && svcID == spec.ServiceID {
+				nonce = parsedNonce
+			}
 		}
-		nonce = parsedNonce
 	}
 
-	// Reserve x402 nonce atomically to prevent replay
+	memo, err := FormatInvoiceMemo(spec.ServiceID, nonce)
+	if err != nil {
+		http.Error(w, `{"error":"invalid nonce"}`, http.StatusBadRequest)
+		return
+	}
+
 	nKey := strconv.FormatUint(spec.ServiceID, 10) + ":" + nonce
 	m.mu.Lock()
 	if m.usedNonces[nKey] {
@@ -633,13 +793,13 @@ func (m *Middleware) handleX402(
 	m.usedNonces[nKey] = true
 	m.mu.Unlock()
 
-	charge, err := ComputeCharge(spec.UnitPriceUgnot, units)
-	if err != nil {
-		http.Error(w, `{"error":"invalid charge"}`, http.StatusBadRequest)
-		return
+	releaseNonce := func() {
+		m.mu.Lock()
+		delete(m.usedNonces, nKey)
+		m.mu.Unlock()
 	}
-	memo, _ := FormatInvoiceMemo(spec.ServiceID, nonce)
-	reqTerms := PaymentRequirements{
+
+	reqSpec := PaymentRequirements{
 		Scheme:            "exact",
 		Network:           "gno:" + m.cfg.ChainID,
 		Asset:             "ugnot",
@@ -649,48 +809,48 @@ func (m *Middleware) handleX402(
 		Extra: map[string]any{
 			"areFeesSponsored": false,
 			"memo":             memo,
+			"tollgateRealm":    m.cfg.RealmPath,
+			"tollgateService":  spec.ServiceID,
 		},
 	}
 
-	verifyRes, err := m.cfg.Facilitator.Verify(r.Context(), sigHeader, reqTerms)
-	if err != nil || !verifyRes.IsValid {
-		m.mu.Lock()
-		delete(m.usedNonces, nKey)
-		m.mu.Unlock()
-		reason := verifyRes.InvalidReason
+	vres, err := m.cfg.Facilitator.Verify(r.Context(), paymentSigHeader, reqSpec)
+	if err != nil || !vres.IsValid {
+		releaseNonce()
+		reason := "x402 verification failed"
 		if err != nil {
 			reason = err.Error()
+		} else if vres.InvalidReason != "" {
+			reason = vres.InvalidReason
 		}
-		m.write402(w, r, spec, units, fallbackNonce, "x402 verify refused: "+reason)
+		m.write402(w, r, spec, units, nonce, reason)
 		return
 	}
 
 	buf := newBufferedResponse()
 	next.ServeHTTP(buf, r)
 	if buf.code >= 400 {
-		m.mu.Lock()
-		delete(m.usedNonces, nKey)
-		m.mu.Unlock()
+		releaseNonce()
 		buf.flushTo(w)
 		return
 	}
 
-	settleRes, err := m.cfg.Facilitator.Settle(r.Context(), sigHeader, reqTerms)
-	if err != nil || !settleRes.Success {
-		m.mu.Lock()
-		delete(m.usedNonces, nKey)
-		m.mu.Unlock()
-		reason := settleRes.ErrorReason
+	sres, err := m.cfg.Facilitator.Settle(r.Context(), paymentSigHeader, reqSpec)
+	if err != nil || !sres.Success {
+		releaseNonce()
+		reason := "x402 settlement failed"
 		if err != nil {
 			reason = err.Error()
+		} else if sres.ErrorReason != "" {
+			reason = sres.ErrorReason
 		}
-		m.write402(w, r, spec, units, fallbackNonce, "x402 settle failed: "+reason)
+		m.write402(w, r, spec, units, nonce, reason)
 		return
 	}
 
-	payer := settleRes.Payer
+	payer := sres.Payer
 	if payer == "" {
-		payer = verifyRes.Payer
+		payer = vres.Payer
 	}
 	commitment := ReceiptCommitment(
 		m.cfg.ChainID, spec.ServiceID, 0, payer, spec.PayTo,
@@ -710,20 +870,21 @@ func (m *Middleware) handleX402(
 		Nonce:        nonce,
 		ResourceHash: resHash,
 		Commitment:   commitment,
-		TxHash:       settleRes.Transaction,
+		TxHash:       sres.Transaction,
 		CreatedAt:    time.Now().UTC(),
 	})
 	m.saveStateLocked()
 	m.mu.Unlock()
 
-	payRespRaw, _ := json.Marshal(settleRes)
-	buf.header.Set(HeaderPaymentResponse, base64.StdEncoding.EncodeToString(payRespRaw))
-	buf.header.Set(HeaderTollgateRail, "x402-direct")
-	buf.header.Set(HeaderTollgateServiceID, strconv.FormatUint(spec.ServiceID, 10))
-	buf.header.Set(HeaderTollgateNonce, nonce)
-	buf.header.Set(HeaderTollgateResHash, resHash)
-	buf.header.Set(HeaderTollgateCommitment, commitment)
-	buf.header.Set(HeaderTollgateNetUgnot, strconv.FormatInt(charge.NetUgnot, 10))
+	payRespJSON, _ := json.Marshal(sres)
+	buf.Header().Set(HeaderPaymentResponse, base64.StdEncoding.EncodeToString(payRespJSON))
+	buf.Header().Set(HeaderTollgateRail, "x402-direct")
+	buf.Header().Set(HeaderTollgateServiceID, strconv.FormatUint(spec.ServiceID, 10))
+	buf.Header().Set(HeaderTollgateRealm, m.cfg.RealmPath)
+	buf.Header().Set(HeaderTollgateNonce, nonce)
+	buf.Header().Set(HeaderTollgateResHash, resHash)
+	buf.Header().Set(HeaderTollgateNetUgnot, strconv.FormatInt(charge.NetUgnot, 10))
+	buf.Header().Set(HeaderTollgateCommitment, commitment)
 	buf.flushTo(w)
 }
 
@@ -733,64 +894,61 @@ func (m *Middleware) write402(
 	spec RouteSpec,
 	units int64,
 	nonce string,
-	errMsg string,
+	reason string,
 ) {
-	charge, _ := ComputeCharge(spec.UnitPriceUgnot, units)
+	charge, err := ComputeCharge(spec.UnitPriceUgnot, units)
+	if err != nil {
+		charge = ChargeBreakdown{Units: 1, UnitPrice: spec.UnitPriceUgnot, GrossUgnot: spec.UnitPriceUgnot, NetUgnot: spec.UnitPriceUgnot}
+	}
 	memo, _ := FormatInvoiceMemo(spec.ServiceID, nonce)
-	scheme := "https"
-	if r.TLS == nil {
-		scheme = "http"
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
 	}
-	resourceURL := fmt.Sprintf("%s://%s%s", scheme, r.Host, r.URL.RequestURI())
-	mime := spec.MimeType
-	if mime == "" {
-		mime = "application/json"
-	}
-
+	fullURL := fmt.Sprintf("%s://%s%s", scheme, r.Host, r.URL.RequestURI())
 	pr := PaymentRequired{
 		X402Version: 2,
-		Error:       errMsg,
+		Error:       reason,
 		Resource: X402Resource{
-			URL:         resourceURL,
+			URL:         fullURL,
 			Description: spec.Description,
-			MimeType:    mime,
+			MimeType:    spec.MimeType,
 		},
-		Accepts: []PaymentRequirements{{
-			Scheme:            "exact",
-			Network:           "gno:" + m.cfg.ChainID,
-			Asset:             "ugnot",
-			Amount:            strconv.FormatInt(charge.NetUgnot, 10),
-			PayTo:             spec.PayTo,
-			MaxTimeoutSeconds: 300,
-			Extra: map[string]any{
-				"areFeesSponsored": false,
-				"memo":             memo,
-				"tollgateRealm":    m.cfg.RealmPath,
-				"tollgateService":  spec.ServiceID,
+		Accepts: []PaymentRequirements{
+			{
+				Scheme:            "exact",
+				Network:           "gno:" + m.cfg.ChainID,
+				Asset:             "ugnot",
+				Amount:            strconv.FormatInt(charge.NetUgnot, 10),
+				PayTo:             spec.PayTo,
+				MaxTimeoutSeconds: 300,
+				Extra: map[string]any{
+					"areFeesSponsored": false,
+					"memo":             memo,
+					"tollgateRealm":    m.cfg.RealmPath,
+					"tollgateService":  spec.ServiceID,
+				},
 			},
-		}},
+		},
 	}
-
 	encoded, _ := EncodePaymentRequired(pr)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set(HeaderPaymentRequired, encoded)
-	w.Header().Set(HeaderTollgateServiceID, strconv.FormatUint(spec.ServiceID, 10))
 	w.Header().Set(HeaderTollgateRealm, m.cfg.RealmPath)
+	w.Header().Set(HeaderTollgateServiceID, strconv.FormatUint(spec.ServiceID, 10))
 	w.Header().Set(HeaderTollgateNonce, nonce)
+	w.Header().Set(HeaderTollgateNetUgnot, strconv.FormatInt(charge.NetUgnot, 10))
 	w.WriteHeader(http.StatusPaymentRequired)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":          402,
-		"error":           errMsg,
-		"x402Version":     2,
-		"paymentRequired": pr,
-		"tollgateRails": map[string]any{
-			"realmPath":      m.cfg.RealmPath,
-			"serviceId":      spec.ServiceID,
-			"passHeader":     HeaderTollgatePass,
-			"subHeader":      HeaderTollgateSub,
-			"voucherHeader":  HeaderTollgateVoucherSig,
-			"x402Header":     HeaderPaymentSignature,
-			"volumeDiscount": charge,
-		},
+		"error":             reason,
+		"x402Version":       2,
+		"tollgateRealm":     m.cfg.RealmPath,
+		"tollgateServiceId": spec.ServiceID,
+		"units":             charge.Units,
+		"grossUgnot":        charge.GrossUgnot,
+		"discountBps":       charge.DiscountBps,
+		"netUgnot":          charge.NetUgnot,
+		"memo":              memo,
+		"acceptedRails":     []string{"X-Tollgate-Sub", "X-Tollgate-Pass", "PAYMENT-SIGNATURE (gnolang/x402)"},
 	})
 }

@@ -77,3 +77,8 @@ test("decodePaymentRequired decodes x402 v2 base64 header", () => {
   assert.equal(pr.x402Version, 2);
   assert.equal(pr.accepts[0].network, "gno:onyx-1");
 });
+
+test("shared cross-language PayWord golden vector matches Gno & Go SDK byte-for-byte", () => {
+  const got = payWordStep("onyx-1", "0000000000000000000000000000000000000000000000000000000000000000");
+  assert.equal(got, "33166b8a509fc02566aa139ef29415c7458dc917ddd3a559f42649d59faf2d05");
+});

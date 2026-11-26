@@ -47,3 +47,11 @@ func TestChargeAndMemo(t *testing.T) {
 		t.Fatalf("memo parse mismatch: %d %q %v", id, nonce, ok)
 	}
 }
+
+func TestCrossLanguagePayWordGoldenVector(t *testing.T) {
+	got := PayWordStep("onyx-1", "0000000000000000000000000000000000000000000000000000000000000000")
+	want := "33166b8a509fc02566aa139ef29415c7458dc917ddd3a559f42649d59faf2d05"
+	if got != want {
+		t.Fatalf("PayWordStep golden mismatch: got %s want %s", got, want)
+	}
+}
