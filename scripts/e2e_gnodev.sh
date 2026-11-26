@@ -38,7 +38,7 @@ wait_next_block() {
   done
 }
 
-echo "[1/8] Starting local gnodev (v1.8.0-rc.1)..."
+echo "[1/9] Starting local gnodev (v1.8.0-rc.1)..."
 "$BIN/gnodev" local \
   -C /tmp \
   -root "$GNOROOT" \
@@ -58,7 +58,7 @@ for _ in $(seq 1 90); do
 done
 curl -sS "${RPC_URL}/status" | grep -q "latest_block_height"
 
-echo "[2/8] Deploying /p/tollgate and /r/tollgate/v2 (PayWord SHA-256) to gnodev..."
+echo "[2/9] Deploying /p/tollgate and /r/tollgate/v2 (PayWord SHA-256) to gnodev..."
 printf "%s\n" "$PW" | "$BIN/gnokey" maketx addpkg deployer \
   -home "$KEYHOME" -insecure-password-stdin \
   -remote "$RPC_URL" -chainid "$CHAIN_ID" -broadcast \
@@ -73,7 +73,7 @@ printf "%s\n" "$PW" | "$BIN/gnokey" maketx addpkg deployer \
   -pkgpath "$R_PATH" -pkgdir "$ROOT/gno/r/${ADDR}/tollgate/v2"
 wait_next_block
 
-echo "[3/8] Generating SEPARATE PayWord SHA-256 chains for pass & sub & seeding..."
+echo "[3/9] Generating SEPARATE PayWord SHA-256 chains for pass & sub & seeding..."
 PASS_KP=$("$ROOT/bin/tollgate-agent" keygen --chain-id "$CHAIN_ID" --depth 1000)
 PASS_ANCHOR=$(echo "$PASS_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)['anchorHex'])")
 PASS_SEED=$(echo "$PASS_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)['seedHex'])")
@@ -113,7 +113,7 @@ printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
   -args "1" -args "$SUB_ANCHOR"
 wait_next_block
 
-echo "[4/8] Starting live tollgate-gateway with PayWord auth, persistent state, and on-chain GnokeySubmitter..."
+echo "[4/9] Starting live tollgate-gateway with PayWord auth, persistent state, and on-chain GnokeySubmitter..."
 "$ROOT/bin/tollgate-gateway" \
   --listen "127.0.0.1:${GW_PORT}" \
   --rpc "$RPC_URL" \
@@ -139,7 +139,7 @@ for _ in $(seq 1 20); do
   sleep 0.25
 done
 
-echo "[5/8] Verifying unsigned pass request is rejected (HTTP 401)..."
+echo "[5/9] Verifying unsigned pass request is rejected (HTTP 401)..."
 UNAUTH_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
   -H "X-Tollgate-Pass: 1" -H "X-Tollgate-Units: 1" -H "X-Tollgate-Nonce: unsigned-attempt" \
   "http://127.0.0.1:${GW_PORT}/api/v1/oracle?pair=GNOT-USD")
@@ -149,7 +149,7 @@ if [[ "$UNAUTH_CODE" != "401" ]]; then
 fi
 echo "Unsigned request rejected cleanly with HTTP 401."
 
-echo "[6/8] Running TWO consecutive stateful agent pass calls BEFORE flush + replay check + sub call..."
+echo "[6/9] Running TWO consecutive stateful agent pass calls BEFORE flush + replay check + sub call..."
 PASS1_OUT=$("$ROOT/bin/tollgate-agent" call \
   --url "http://127.0.0.1:${GW_PORT}/api/v1/oracle?pair=GNOT-USD" \
   --rpc "$RPC_URL" --realm "$R_PATH" --pass 1 --units 10 --nonce "e2e-pass-001" \
@@ -181,7 +181,7 @@ SUB_OUT=$("$ROOT/bin/tollgate-agent" call \
   --voucher-key "$SUB_SEED" --payword-depth 1000 --state-file "$AGENT_STATE")
 echo "$SUB_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['probeStatus']==402 and d['finalStatus']==200 and d['selectedRail']=='subscription' and d['localProofVerified']==True and len(d['voucherProofHex'])==64, d"
 
-echo "[7/8] Checking MCP stdio server & flushing ALL 3 chained PayWord receipts on-chain (/api/settle-now)..."
+echo "[7/9] Checking MCP stdio server & flushing ALL 3 chained PayWord receipts on-chain (/api/settle-now)..."
 MCP_OUT=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tollgate_chain_summary","arguments":{}}}\n' \
   | "$ROOT/bin/tollgate-agent" mcp --rpc "$RPC_URL" --realm "$R_PATH" --voucher-key "$PASS_SEED" --state-file "$AGENT_STATE")
 echo "$MCP_OUT" | grep -q "tollgate_paid_fetch"
@@ -192,10 +192,91 @@ echo "$SETTLE_OUT"
 echo "$SETTLE_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['settled']==3 and all(r['settled'] for r in d['receipts']), d"
 wait_next_block
 
-echo "[8/8] Verifying ALL 3 gateway-settled PayWord receipts on-chain & checking gnoweb rendering..."
+echo "[8/9] Simulating gateway crash after on-chain commit (live GnokeySubmitter duplicate-nonce recovery + chained follow-up)..."
+kill "$GW_PID" 2>/dev/null || true
+wait "$GW_PID" 2>/dev/null || true
+GW_PID=""
+
+# Roll back e2e-pass-002 to unsettled in gateway state file to simulate a crash right after gnodev committed ClaimSettlement.
+python3 - "$STATE_FILE" <<'PYSTATE'
+import json, sys
+p = sys.argv[1]
+st = json.load(open(p))
+flipped = 0
+for r in st["receipts"]:
+    if r.get("nonce") == "e2e-pass-002":
+        r["settled"] = False
+        r["deadLetter"] = False
+        r["txHash"] = ""
+        r["lastError"] = ""
+        r["attempts"] = 0
+        flipped += 1
+assert flipped == 1, f"expected 1 e2e-pass-002 receipt, flipped {flipped}"
+json.dump(st, open(p, "w"), indent=2)
+PYSTATE
+
+"$ROOT/bin/tollgate-gateway" \
+  --listen "127.0.0.1:${GW_PORT}" \
+  --rpc "$RPC_URL" \
+  --realm "$R_PATH" \
+  --chain-id "$CHAIN_ID" \
+  --pay-to "$ADDR" \
+  --service-id 1 \
+  --unit-price 1000 \
+  --web "$ROOT/web" \
+  --state-file "$STATE_FILE" \
+  --require-auth=true --auto-settle=0 \
+  --gnokey-bin "$BIN/gnokey" \
+  --key-name deployer \
+  --key-home "$KEYHOME" \
+  --key-pass-file "$PW_FILE" \
+  >> /tmp/tollgate-gw.log 2>&1 &
+GW_PID=$!
+
+for _ in $(seq 1 20); do
+  if curl -sS "http://127.0.0.1:${GW_PORT}/api/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+
+# Issue follow-up chained PayWord call e2e-pass-003 (3u) while crashed e2e-pass-002 is still marked unsettled.
+PASS3_OUT=$("$ROOT/bin/tollgate-agent" call \
+  --url "http://127.0.0.1:${GW_PORT}/api/v1/oracle?pair=GNOT-USD" \
+  --rpc "$RPC_URL" --realm "$R_PATH" --pass 1 --units 3 --nonce "e2e-pass-003" \
+  --voucher-key "$PASS_SEED" --payword-depth 1000 --state-file "$AGENT_STATE")
+echo "$PASS3_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['finalStatus']==200 and d['selectedRail']=='metered-pass' and d['netUgnot']==3000 and d['localProofVerified']==True, d"
+
+# Flush via real GnokeySubmitter: e2e-pass-002 hits live realm panic "tollgate: duplicate nonce",
+# recovers cleanly via Chain.Receipt(commitment), and immediately settles e2e-pass-003 on-chain!
+CRASH_HTTP=$(curl -sS -o /tmp/tollgate-crash-settle.json -w "%{http_code}" -X POST "http://127.0.0.1:${GW_PORT}/api/settle-now")
+cat /tmp/tollgate-crash-settle.json
+echo ""
+if [[ "$CRASH_HTTP" != "200" ]]; then
+  echo "Expected HTTP 200 on crash-recovery settle-now, got $CRASH_HTTP"
+  exit 1
+fi
+python3 - /tmp/tollgate-crash-settle.json <<'PYCRASH'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["settled"] == 2, f"expected 2 (1 recovered + 1 new), got {d}"
+recs = {r["nonce"]: r for r in d["receipts"]}
+assert recs["e2e-pass-002"]["settled"] is True and not recs["e2e-pass-002"].get("deadLetter"), recs["e2e-pass-002"]
+assert recs["e2e-pass-002"].get("txHash") == "recovered-on-chain", recs["e2e-pass-002"]
+assert recs["e2e-pass-003"]["settled"] is True and not recs["e2e-pass-003"].get("deadLetter"), recs["e2e-pass-003"]
+assert not any(r.get("deadLetter") for r in d["receipts"]), d["receipts"]
+PYCRASH
+grep -q "tollgate: duplicate nonce" /tmp/tollgate-gw.log
+grep -q "crash-recovered already-settled receipt nonce=e2e-pass-002" /tmp/tollgate-gw.log
+rm -f /tmp/tollgate-crash-settle.json
+wait_next_block
+echo "Live gnodev crash-recovery verified: GnokeySubmitter hit real 'tollgate: duplicate nonce', reconciled e2e-pass-002 on-chain, and settled e2e-pass-003!"
+
+echo "[9/9] Verifying ALL 4 gateway-settled PayWord receipts on-chain & checking gnoweb rendering..."
 for COMMIT in \
   "$(echo "$PASS1_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['receiptCommitment'])")" \
   "$(echo "$PASS2_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['receiptCommitment'])")" \
+  "$(echo "$PASS3_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['receiptCommitment'])")" \
   "$(echo "$SUB_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['receiptCommitment'])")"; do
   VOUT=$("$ROOT/bin/tollgate-agent" verify --rpc "$RPC_URL" --realm "$R_PATH" --receipt "$COMMIT")
   echo "$VOUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['verified']==True and d['onChainReceipt']['buyerSigned']==True and d['onChainReceipt']['commitment']=='${COMMIT}', d"
@@ -209,4 +290,4 @@ if echo "$GNOWEB_HTML" | grep -q "GnoLinkTypeInvalid\|data-invalid"; then
   exit 1
 fi
 
-echo "=== TOLLGATE E2E GNODEV 100% GREEN (CHAINED PAYWORD + ON-CHAIN SETTLEMENT + GNOWEB) ==="
+echo "=== TOLLGATE E2E GNODEV 100% GREEN (CHAINED PAYWORD + LIVE CRASH RECOVERY + ON-CHAIN SETTLEMENT + GNOWEB) ==="

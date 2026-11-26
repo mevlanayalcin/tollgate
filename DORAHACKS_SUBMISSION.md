@@ -8,7 +8,7 @@
 - **Live `onyx-1` Pure Package:** https://onyx.testnets.gno.land/p/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate
 - **GPAS Verification (`passed`):** https://gpas.onyx.testnets.gno.land/?path=gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2
 - **HD Demo Video (1080p MP4, 2m15s):** https://github.com/mevlanayalcin/tollgate/releases/download/v1.0.0/tollgate-demo-1080p.mp4
-- **Self-Published Static Analysis Certificate (Author's Companion Analyzer `r/.../ironclad` #6 — Grade A+ 100/100):** https://onyx.testnets.gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/ironclad:attestation/6
+- **Self-Published Static Analysis Certificate (Author's Companion Analyzer `r/.../ironclad` #6 — Grade A+ 100/100):** https://onyx.testnets.gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/ironclad:attestation/6 _(independently reproducible via `ironclad scan --rpc https://rpc.onyx.testnets.gno.land:443 --pkg gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2`)_
 
 ## Live `onyx-1` On-Chain Proofs (`v1.8.0-rc.1` toolchain)
 > _Transparency note:_ The 7 demo calls below were submitted directly via `gnokey` (`scripts/deploy_onyx.sh`) with the deployer address acting as buyer, provider, and `payTo`. Receipt `#3` (`x402-onyx-facilitator-demo-001`) is a synthetic `RecordX402Receipt` anchor demonstrating the schema (no external x402 facilitator payment occurred; stock x402 middleware interop is tested against a mock facilitator in `sdk/go/middleware_test.go`). Immutable `render.gno` headers on `tollgate/v2` still show legacy `"Ed25519"` column text from v1 while the active on-chain verifier executes pure `crypto/sha256` PayWord hash-chain proofs (`payword:<hash>`).

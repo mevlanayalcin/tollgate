@@ -495,14 +495,14 @@ func TestPayWordCrashRecoveryDuplicateNonceReconcilesQueue(t *testing.T) {
 	mw.mu.Unlock()
 
 	settled, err := mw.FlushSettlements(context.Background())
-	if settled != 2 {
-		t.Fatalf("expected crash-1 recovered + after-2 settled (2), got settled=%d err=%v", settled, err)
+	if err != nil || settled != 2 {
+		t.Fatalf("expected clean crash-1 recovery + after-2 settle (settled=2, err=nil), got settled=%d err=%v", settled, err)
 	}
 	if len(sub.settled) != 1 || sub.settled[0] != "after-2" {
 		t.Fatalf("expected after-2 submitted after crash-1 recovery, got %v", sub.settled)
 	}
 	recs := mw.Receipts()
-	if !recs[0].Settled || !recs[1].Settled || recs[0].DeadLetter || recs[1].DeadLetter {
+	if !recs[0].Settled || !recs[1].Settled || recs[0].DeadLetter || recs[1].DeadLetter || recs[0].TxHash != "recovered-on-chain" {
 		t.Fatalf("unexpected receipt states after crash recovery: %+v", recs)
 	}
 }

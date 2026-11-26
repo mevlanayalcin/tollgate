@@ -279,9 +279,6 @@ func (m *Middleware) FlushSettlements(ctx context.Context) (int, error) {
 
 		txHash, err := m.cfg.Submitter.SubmitReceipt(ctx, rec)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
 			perm := isPermanentSettlementError(err)
 
 			// Crash-recovery check: on ANY submit error (including "tollgate: duplicate nonce"
@@ -313,16 +310,24 @@ func (m *Middleware) FlushSettlements(ctx context.Context) (int, error) {
 			}
 
 			if recovered {
+				log.Printf("tollgate: crash-recovered already-settled receipt nonce=%s commitment=%s after submit error: %v", rec.Nonce, rec.Commitment, err)
 				m.mu.Lock()
 				if !m.receipts[idx].Settled {
 					m.receipts[idx].Settled = true
 					m.receipts[idx].LastError = ""
+					if m.receipts[idx].TxHash == "" {
+						m.receipts[idx].TxHash = "recovered-on-chain"
+					}
 					m.releaseReservationLocked(rec)
 					m.saveStateLocked()
 					settledCount++
 				}
 				m.mu.Unlock()
 				continue
+			}
+
+			if firstErr == nil {
+				firstErr = err
 			}
 
 			m.mu.Lock()
