@@ -485,6 +485,9 @@ func runMCP(args []string) {
 				result = map[string]any{"content": []map[string]any{{"type": "text", "text": string(text)}}}
 			}
 		}
+		if req.ID == nil {
+			continue
+		}
 		resp := map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result}
 		raw, _ := json.Marshal(resp)
 		fmt.Println(string(raw))

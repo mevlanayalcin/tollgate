@@ -444,3 +444,96 @@ func TestPayWordTransientRPCOutageDoesNotDeadLetterChain(t *testing.T) {
 		t.Fatalf("recovery flush failed: n=%d err=%v settled=%v", n, err, sub.settled)
 	}
 }
+
+type crashDupSubmitter struct {
+	dupNonce string
+	settled  []string
+}
+
+func (c *crashDupSubmitter) SubmitReceipt(_ context.Context, r PendingReceipt) (string, error) {
+	if r.Nonce == c.dupNonce {
+		return "", errors.New("gnokey metered-pass failed: panic: tollgate: duplicate nonce")
+	}
+	c.settled = append(c.settled, r.Nonce)
+	return "tx-" + r.Nonce, nil
+}
+
+type chainWithReceipt struct {
+	fakeChain
+	receipts map[string]ReceiptInfo
+}
+
+func (c *chainWithReceipt) Receipt(_ context.Context, idOrHash string) (ReceiptInfo, error) {
+	if r, ok := c.receipts[idOrHash]; ok {
+		return r, nil
+	}
+	return ReceiptInfo{}, errors.New("not found")
+}
+
+func TestPayWordCrashRecoveryDuplicateNonceReconcilesQueue(t *testing.T) {
+	c1 := HashResource("commit-1")
+	c2 := HashResource("commit-2")
+	ch := &chainWithReceipt{
+		fakeChain: fakeChain{
+			pass: PassInfo{ID: 1, VoucherPubKey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		},
+		receipts: map[string]ReceiptInfo{
+			c1: {ID: 1, Commitment: c1, Nonce: "crash-1"},
+		},
+	}
+	sub := &crashDupSubmitter{dupNonce: "crash-1"}
+	mw := NewMiddleware(MiddlewareConfig{
+		ChainID: "onyx-1", RealmPath: "gno.land/r/test/tollgate/v2",
+		Chain: ch, Submitter: sub,
+	})
+	mw.mu.Lock()
+	mw.receipts = []PendingReceipt{
+		{Rail: "metered-pass", PassID: 1, Units: 2, AmountUgnot: 2000, Nonce: "crash-1", Commitment: c1, BuyerSigHex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		{Rail: "metered-pass", PassID: 1, Units: 1, AmountUgnot: 1000, Nonce: "after-2", Commitment: c2, BuyerSigHex: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+	}
+	mw.localDebits[1] = 3000
+	mw.mu.Unlock()
+
+	settled, err := mw.FlushSettlements(context.Background())
+	if settled != 2 {
+		t.Fatalf("expected crash-1 recovered + after-2 settled (2), got settled=%d err=%v", settled, err)
+	}
+	if len(sub.settled) != 1 || sub.settled[0] != "after-2" {
+		t.Fatalf("expected after-2 submitted after crash-1 recovery, got %v", sub.settled)
+	}
+	recs := mw.Receipts()
+	if !recs[0].Settled || !recs[1].Settled || recs[0].DeadLetter || recs[1].DeadLetter {
+		t.Fatalf("unexpected receipt states after crash recovery: %+v", recs)
+	}
+}
+
+type http404Submitter struct{}
+
+func (h *http404Submitter) SubmitReceipt(_ context.Context, _ PendingReceipt) (string, error) {
+	return "", errors.New("rpc http 404 page not found")
+}
+
+func TestHTTP404ProxyErrorDoesNotDeadLetterPayWord(t *testing.T) {
+	mw := NewMiddleware(MiddlewareConfig{
+		ChainID: "onyx-1", RealmPath: "gno.land/r/test/tollgate/v2",
+		Submitter: &http404Submitter{},
+	})
+	mw.mu.Lock()
+	mw.localPassAnchor[1] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	mw.receipts = []PendingReceipt{
+		{Rail: "metered-pass", PassID: 1, Units: 1, AmountUgnot: 1000, Nonce: "n-404", BuyerSigHex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	}
+	mw.mu.Unlock()
+
+	n, err := mw.FlushSettlements(context.Background())
+	if err == nil || n != 0 {
+		t.Fatalf("expected transient error, got n=%d err=%v", n, err)
+	}
+	recs := mw.Receipts()
+	if recs[0].DeadLetter {
+		t.Fatalf("HTTP 404 proxy error must NOT dead-letter PayWord receipt")
+	}
+	if mw.localPassAnchor[1] == "" {
+		t.Fatalf("HTTP 404 proxy error must NOT clear localPassAnchor")
+	}
+}

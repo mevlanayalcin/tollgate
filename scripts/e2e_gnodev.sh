@@ -209,4 +209,4 @@ if echo "$GNOWEB_HTML" | grep -q "GnoLinkTypeInvalid\|data-invalid"; then
   exit 1
 fi
 
-echo "=== TOLLGATE E2E GNODEV 100% GREEN (CHAINED PAYWORD + CONCURRENCY + AUTO-SETTLE + GNOWEB) ==="
+echo "=== TOLLGATE E2E GNODEV 100% GREEN (CHAINED PAYWORD + ON-CHAIN SETTLEMENT + GNOWEB) ==="

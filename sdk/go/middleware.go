@@ -203,8 +203,13 @@ func isPermanentSettlementError(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
+	// Only treat explicit on-chain realm panics ("tollgate: ...") as permanent so
+	// HTTP/RPC proxy errors such as "404 page not found" are never dead-lettered.
+	if !strings.Contains(msg, "tollgate:") {
+		return false
+	}
 	for _, pat := range []string{
-		"already used", "expired", "is closed", "invalid buyer",
+		"duplicate nonce", "already used", "expired", "is closed", "invalid buyer",
 		"not found", "invalid payword", "out of bounds", "exceeds",
 	} {
 		if strings.Contains(msg, pat) {
@@ -219,6 +224,9 @@ func isTerminalChainError(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "tollgate:") {
+		return false
+	}
 	for _, pat := range []string{"expired", "is closed", "not found"} {
 		if strings.Contains(msg, pat) {
 			return true
@@ -276,11 +284,15 @@ func (m *Middleware) FlushSettlements(ctx context.Context) (int, error) {
 			}
 			perm := isPermanentSettlementError(err)
 
-			// Crash-recovery check: if an already-broadcast PayWord receipt returns
-			// "already used" / "invalid payword", verify whether on-chain state already
-			// moved to rec.BuyerSigHex (or whether the chain diverged).
+			// Crash-recovery check: on ANY submit error (including "tollgate: duplicate nonce"
+			// or post-broadcast timeout), look up the receipt by commitment on chain first.
 			recovered := false
-			if perm && m.cfg.Chain != nil && rec.BuyerSigHex != "" {
+			if m.cfg.Chain != nil && rec.Commitment != "" {
+				if onChain, rerr := m.cfg.Chain.Receipt(ctx, rec.Commitment); rerr == nil && onChain.Commitment == rec.Commitment {
+					recovered = true
+				}
+			}
+			if !recovered && perm && m.cfg.Chain != nil && rec.BuyerSigHex != "" {
 				if rec.Rail == "metered-pass" && rec.PassID > 0 {
 					if p, cerr := m.cfg.Chain.Pass(ctx, rec.PassID); cerr == nil {
 						if p.VoucherPubKey == rec.BuyerSigHex {
