@@ -3,129 +3,175 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Tollgate — On-Chain x402 Metering &amp; Receipt Explorer</title>
+  <title>Tollgate — On-Chain HTTP 402 (x402) Metering Vault &amp; PayWord dApp</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <div class="wrap">
     <header>
-      <div class="brand">
-        <h1>Tollgate Protocol</h1>
-        <p>On-chain HTTP 402 (<code>gnolang/x402</code>) metering vaults, PayWord SHA-256 hash-chain prepaid passes, subscriptions &amp; verifiable SHA-256 receipts on Gno.land</p>
+      <div>
+        <h1><span class="logo-mark">TG</span> Tollgate Metering Vault &amp; x402 dApp</h1>
+        <p class="sub">Stateful HTTP 402 (<code>gnolang/x402</code>) metering escrow, pure <code>crypto/sha256</code> Rivest-Shamir PayWord credit passes, challenge-window settlements, upfront subscriptions &amp; Adena Wallet broadcasting on Gno.land <code>onyx-1</code>.</p>
       </div>
-      <div class="badge-row">
-        <span class="badge" id="chainBadge">chain: onyx-1</span>
-        <span class="badge ok" id="statusBadge">RPC: connecting…</span>
+      <div class="header-right">
+        <div class="badges">
+          <span class="badge" id="chainBadge">chain: onyx-1</span>
+          <span class="badge ok" id="statusBadge">RPC: syncing…</span>
+          <button id="connectAdenaBtn">Connect Adena Wallet</button>
+        </div>
+        <div class="wallet-status" id="walletStatus">Adena: not connected · Live Realm: <a href="https://onyx.testnets.gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2" target="_blank" rel="noopener">gno.land/r/g1zt…/tollgate/v2</a></div>
       </div>
     </header>
 
-    <section class="card" style="margin-top:16px">
-      <div class="row" style="align-items:flex-end">
-        <div class="field" style="flex:1.4">
-          <label for="rpcInput">Gno RPC Endpoint (Onyx-1 or local gnodev)</label>
-          <input id="rpcInput" value="https://rpc.onyx.testnets.gno.land:443" />
-        </div>
-        <div class="field" style="flex:1.6">
-          <label for="realmInput">Tollgate Realm Path</label>
-          <input id="realmInput" value="gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2" />
-        </div>
-        <div class="field" style="flex:1.1">
-          <label for="gatewayInput">Tollgate HTTP 402 Gateway URL (optional)</label>
-          <input id="gatewayInput" value="" placeholder="Same-origin or http://127.0.0.1:8402" />
-        </div>
-        <div>
-          <button id="refreshBtn">Sync Chain</button>
-        </div>
-      </div>
-    </section>
-
-    <section class="grid-stats">
-      <div class="stat"><div class="k">Vault TVL</div><div class="v" id="statTvl">—</div></div>
-      <div class="stat"><div class="k">Block Height</div><div class="v" id="statHeight">—</div></div>
+    <section class="stats-strip">
+      <div class="stat"><div class="k">Vault Escrow TVL</div><div class="v ok" id="statTvl">—</div></div>
+      <div class="stat"><div class="k">onyx-1 Height</div><div class="v" id="statHeight">—</div></div>
       <div class="stat"><div class="k">Services</div><div class="v" id="statServices">—</div></div>
-      <div class="stat"><div class="k">Credit Passes</div><div class="v" id="statPasses">—</div></div>
+      <div class="stat"><div class="k">Active Passes</div><div class="v" id="statPasses">—</div></div>
       <div class="stat"><div class="k">Subscriptions</div><div class="v" id="statSubs">—</div></div>
-      <div class="stat"><div class="k">Verified Receipts</div><div class="v" id="statReceipts">—</div></div>
+      <div class="stat"><div class="k">Verified Receipts</div><div class="v ok" id="statReceipts">—</div></div>
     </section>
 
-    <section class="grid-2">
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="explorer">1. Live onyx-1 Vault &amp; Receipt Verifier</button>
+      <button class="tab-btn" data-tab="adena">2. Adena Wallet Actions &amp; PayWord Keygen</button>
+      <button class="tab-btn" data-tab="playground">3. Interactive HTTP 402 + PayWord Playground</button>
+    </nav>
+
+    <!-- TAB 1: LIVE VAULT & RECEIPT VERIFIER -->
+    <section id="tab-explorer" class="tab-panel active">
       <div class="card">
-        <h2>Interactive HTTP 402 &amp; Dual-Rail Playground</h2>
-        <p class="muted">Probe a metered endpoint with no headers to inspect its live <code>x402 v2 PAYMENT-REQUIRED</code> offer, or attach a Tollgate Pass / Subscription header plus an PayWord SHA-256 voucher preimage (<code>X-Tollgate-Voucher-Sig</code>) for single-round-trip metered access with batched on-chain settlement.</p>
+        <h2>
+          <span>Live <code>onyx-1</code> Services &amp; Realm Config</span>
+          <button id="refreshBtn" class="secondary sm">Refresh Chain</button>
+        </h2>
         <div class="row">
-          <div class="field">
-            <label for="endpointSelect">Metered Endpoint</label>
-            <select id="endpointSelect">
-              <option value="/api/v1/oracle?pair=GNOT-USD">GET /api/v1/oracle?pair=GNOT-USD</option>
-              <option value="/api/v1/weather?city=zurich">GET /api/v1/weather?city=zurich</option>
-            </select>
-          </div>
-          <div class="field" style="max-width:110px">
-            <label for="unitsInput">Units</label>
-            <input id="unitsInput" type="number" min="1" max="1000" value="10" />
-          </div>
+          <div class="field"><label for="rpcInput">Gno RPC URL</label><input id="rpcInput" value="https://rpc.onyx.testnets.gno.land:443" /></div>
+          <div class="field"><label for="realmInput">Tollgate Realm Path</label><input id="realmInput" value="gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2" /></div>
+          <div class="field"><label for="gatewayInput">Optional Local Gateway URL (leave blank for browser simulator)</label><input id="gatewayInput" placeholder="e.g. http://127.0.0.1:8402" /></div>
         </div>
-        <div class="row">
-          <div class="field">
-            <label for="passIdInput">X-Tollgate-Pass (optional)</label>
-            <input id="passIdInput" placeholder="e.g. 1" />
-          </div>
-          <div class="field">
-            <label for="subIdInput">X-Tollgate-Sub (optional)</label>
-            <input id="subIdInput" placeholder="e.g. 1" />
-          </div>
+        <div style="overflow-x:auto">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th><th>Slug</th><th>Name</th><th>Unit Price</th><th>Subscription Plan</th><th>Challenge</th><th>Calls</th><th>Escrow Rev.</th><th>x402 Attested</th>
+              </tr>
+            </thead>
+            <tbody id="servicesBody"><tr><td colspan="9" class="muted">Syncing live onyx-1 state…</td></tr></tbody>
+          </table>
         </div>
-        <div class="row">
-          <div class="field">
-            <label for="voucherSigInput">X-Tollgate-Voucher-Sig (64-char PayWord SHA-256 preimage hex, optional if auth disabled)</label>
-            <input id="voucherSigInput" placeholder="Signed with tollgate-agent or SDK payword-proof / payWordProofForAnchor(...)" />
-          </div>
-        </div>
-        <div class="row">
-          <button id="probe402Btn" class="secondary">1. Probe Unpaid (402)</button>
-          <button id="callPaidBtn" class="success">2. Execute Metered Call</button>
-          <span id="httpStatusPill" class="pill" style="align-self:center"></span>
-        </div>
-        <pre id="playgroundOutput">Click "1. Probe Unpaid (402)" to inspect the live x402 v2 PAYMENT-REQUIRED header and volume discount schedule.</pre>
       </div>
 
       <div class="card">
-        <h2>Client-Side SHA-256 Receipt Commitment Verifier</h2>
-        <p class="muted">Recomputes the exact length-prefixed <code>tollgate-receipt-v1</code> SHA-256 digest in-browser via WebCrypto and cross-checks against the live Gno realm (rejecting refunded settlements).</p>
-        <div class="row">
-          <div class="field">
-            <label for="lookupReceiptInput">Lookup On-Chain Receipt ID or Commitment Hash</label>
-            <input id="lookupReceiptInput" placeholder="e.g. 1 or 64-char sha256 hex" value="1" />
-          </div>
-          <div style="align-self:flex-end">
-            <button id="verifyReceiptBtn">Fetch &amp; Verify</button>
-          </div>
+        <h2>Trustless On-Chain Receipt Cryptographic Verifier (WebCrypto SHA-256)</h2>
+        <p class="muted">Fetches any live receipt from <code>r/.../tollgate/v2:json/receipt/&lt;id&gt;</code>, independently recomputes the length-prefixed canonical <code>tollgate-receipt-v1</code> SHA-256 commitment in your browser, and confirms non-refunded settlement status.</p>
+        <div class="chips">
+          <span class="chip" data-rid="1">Verify Receipt #1 (Pass PayWord · 9,500 ugnot)</span>
+          <span class="chip" data-rid="2">Verify Receipt #2 (Sub PayWord · 2 units)</span>
+          <span class="chip" data-rid="3">Verify Receipt #3 (x402 Demo Anchor · 1,000 ugnot)</span>
         </div>
-        <pre id="verifierOutput">Enter an on-chain Receipt ID or SHA-256 commitment hash and click "Fetch &amp; Verify".</pre>
+        <div class="row">
+          <div class="field"><label for="lookupReceiptInput">Receipt ID or 64-char Commitment Hash</label><input id="lookupReceiptInput" value="1" /></div>
+          <button id="verifyReceiptBtn" class="success">Verify On-Chain Commitment</button>
+        </div>
+        <pre id="verifierOutput">Click any receipt chip above or "Verify On-Chain Commitment" to cryptographically audit a live onyx-1 receipt.</pre>
       </div>
     </section>
 
-    <section class="card" style="margin-top:16px">
-      <h2>On-Chain Registered Services</h2>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>Slug</th>
-              <th>Name</th>
-              <th>Unit Price</th>
-              <th>Sub Plan</th>
-              <th>Challenge Window</th>
-              <th>Calls</th>
-              <th>On-Chain Rev</th>
-              <th>x402 Attested</th>
-            </tr>
-          </thead>
-          <tbody id="servicesBody">
-            <tr><td colspan="9" class="muted">Waiting for RPC sync…</td></tr>
-          </tbody>
-        </table>
+    <!-- TAB 2: ADENA WALLET ACTIONS + PAYWORD KEYGEN -->
+    <section id="tab-adena" class="tab-panel">
+      <div class="grid-2">
+        <div class="card">
+          <h2>1. Browser-Native PayWord SHA-256 Chain Generator</h2>
+          <p class="muted">Generates a cryptographically random 32-byte buyer seed in WebCrypto and iteratively hashes <code>SHA256("tollgate-payword-v1|" + chainId + "|" + prev)</code> for <code>depth</code> steps to produce your on-chain <code>anchorHex</code> (exact parity with Gno, Go, and TypeScript SDKs).</p>
+          <div class="row">
+            <div class="field" style="max-width:140px"><label>Chain Depth (units)</label><input id="pwDepthInput" type="number" min="10" max="2000" value="200" /></div>
+            <button id="genPayWordBtn" class="success">Generate PayWord Chain</button>
+            <button id="verifyGoldenBtn" class="secondary">Verify Golden Vector</button>
+          </div>
+          <div class="row">
+            <div class="field"><label>Buyer Secret Seed (keep private — never sent on-chain)</label><input id="pwSeedOut" readonly placeholder="Click Generate PayWord Chain…" /></div>
+          </div>
+          <div class="row">
+            <div class="field"><label>Public Anchor Root (sent to OpenPass / Subscribe)</label><input id="pwAnchorOut" readonly placeholder="64-char SHA-256 hex root" /></div>
+          </div>
+          <pre id="pwKeygenLog">Ready. Click "Generate PayWord Chain" to derive a fresh chain, or "Verify Golden Vector" to verify exact cross-language SHA-256 parity (33166b8a…2d05).</pre>
+        </div>
+
+        <div class="card">
+          <h2>2. Broadcast Live <code>onyx-1</code> Transactions via Adena Wallet</h2>
+          <p class="muted">Calls <code>window.adena.DoContract</code> directly against <code>gno.land/r/g1zt…/tollgate/v2</code> (or displays the exact <code>gnokey</code> CLI command if Adena is not installed).</p>
+
+          <h3>Open Prepaid Metered Credit Pass (<code>OpenPass</code>)</h3>
+          <div class="row">
+            <div class="field" style="max-width:95px"><label>Service ID</label><input id="opSvcId" type="number" value="1" /></div>
+            <div class="field" style="max-width:130px"><label>Deposit (ugnot)</label><input id="opDeposit" type="number" value="50000" /></div>
+            <div class="field" style="max-width:130px"><label>Max/Call (ugnot)</label><input id="opMaxCall" type="number" value="10000" /></div>
+            <div class="field" style="max-width:120px"><label>Expiry (blks)</label><input id="opExpiry" type="number" value="500" /></div>
+            <button id="adenaOpenPassBtn">OpenPass (Adena)</button>
+          </div>
+
+          <h3>Purchase Upfront Quota Subscription (<code>Subscribe</code>)</h3>
+          <div class="row">
+            <div class="field" style="max-width:95px"><label>Service ID</label><input id="subSvcId" type="number" value="1" /></div>
+            <div class="field" style="max-width:140px"><label>Price (ugnot)</label><input id="subPrice" type="number" value="10000" /></div>
+            <button id="adenaSubBtn" class="success">Subscribe (Adena)</button>
+          </div>
+
+          <h3>Manage Settlement / Escrow Lifecycle</h3>
+          <div class="row">
+            <div class="field" style="max-width:120px"><label>Settlement / Pass ID</label><input id="mgmtId" type="number" value="1" /></div>
+            <div class="field"><label>Dispute Reason (if disputing)</label><input id="mgmtReason" value="Upstream service failed delivery" /></div>
+          </div>
+          <div class="row">
+            <button id="adenaFinalizeBtn" class="secondary sm">FinalizeSettlement</button>
+            <button id="adenaDisputeBtn" class="warn-btn sm">DisputeSettlement</button>
+            <button id="adenaClosePassBtn" class="danger-btn sm">ClosePass</button>
+          </div>
+          <pre id="adenaTxOut">Connect Adena Wallet and generate a PayWord anchor above to open a live pass or subscription on onyx-1.</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: INTERACTIVE HTTP 402 + PAYWORD PLAYGROUND -->
+    <section id="tab-playground" class="tab-panel">
+      <div class="grid-2">
+        <div class="card">
+          <h2>Interactive HTTP 402 &amp; PayWord Dual-Rail Playground</h2>
+          <p class="muted" id="playgroundModeHint">Works directly on GitHub Pages in <strong>WebCrypto Browser Simulation Mode</strong> (using live <code>onyx-1</code> Service #1 pricing &amp; real SHA-256 PayWord verification), or point "Optional Local Gateway URL" in Tab 1 to a running <code>tollgate-gateway</code> for live HTTP requests.</p>
+          <div class="row">
+            <div class="field">
+              <label for="endpointSelect">Metered API Endpoint</label>
+              <select id="endpointSelect">
+                <option value="/api/v1/oracle?pair=GNOT-USD">GET /api/v1/oracle?pair=GNOT-USD</option>
+                <option value="/api/v1/weather?city=zurich">GET /api/v1/weather?city=zurich</option>
+              </select>
+            </div>
+            <div class="field" style="max-width:110px"><label for="unitsInput">Units</label><input id="unitsInput" type="number" min="1" max="200" value="10" /></div>
+          </div>
+          <div class="row">
+            <div class="field"><label for="passIdInput">X-Tollgate-Pass</label><input id="passIdInput" value="1" /></div>
+            <div class="field"><label for="subIdInput">X-Tollgate-Sub (optional)</label><input id="subIdInput" placeholder="leave blank for metered pass" /></div>
+          </div>
+          <div class="row">
+            <div class="field"><label for="voucherSigInput">X-Tollgate-Voucher-Sig (auto-derived in simulator mode, or paste 64-hex preimage)</label><input id="voucherSigInput" placeholder="Auto-generated by WebCrypto PayWord chain in simulator mode" /></div>
+          </div>
+          <div class="row">
+            <button id="probe402Btn" class="secondary">1. Probe Unpaid (HTTP 402)</button>
+            <button id="callPaidBtn" class="success">2. Execute Metered PayWord Call</button>
+            <button id="testReplayBtn" class="warn-btn">3. Test Replay Attack (HTTP 409)</button>
+            <button id="testOverchargeBtn" class="danger-btn">4. Test Overcharge Forgery</button>
+          </div>
+          <div class="row" style="align-items:center">
+            <span id="httpStatusPill" class="pill">READY</span>
+            <span class="muted mono" id="simCursorLabel" style="margin:0;font-size:0.75rem">PayWord simulator chain ready (0 units spent)</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>HTTP 402 Offer / PayWord Proof / Canonical Receipt Output</h2>
+          <pre id="playgroundOutput">Click "1. Probe Unpaid (HTTP 402)" to inspect the live x402 v2 PAYMENT-REQUIRED offer and volume discount schedule, then "2. Execute Metered PayWord Call" to step the SHA-256 hash chain and verify the receipt commitment.</pre>
+        </div>
       </div>
     </section>
   </div>

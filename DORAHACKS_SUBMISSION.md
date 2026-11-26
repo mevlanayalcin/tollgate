@@ -3,11 +3,11 @@
 - **Project Name:** Tollgate
 - **Tagline (1 line):** On-chain HTTP 402 (`gnolang/x402`) metering vaults, Rivest-Shamir PayWord SHA-256 hash-chain prepaid credit passes, subscriptions & verifiable SHA-256 receipts for Gno.land realms and AI agents.
 - **GitHub Repository:** https://github.com/mevlanayalcin/tollgate
-- **Live Static Web Explorer (GitHub Pages):** https://mevlanayalcin.github.io/tollgate/ _(read-only `onyx-1` RPC explorer + WebCrypto receipt verifier; live HTTP 402 probes connect to a user-run local `tollgate-gateway`)_
+- **Live Static Web Explorer (GitHub Pages):** https://mevlanayalcin.github.io/tollgate/ _(live `onyx-1` RPC vault explorer, Adena Wallet direct transactions, browser-native PayWord SHA-256 chain generator, WebCrypto receipt & golden vector verifier, plus zero-server interactive HTTP 402/409/Overcharge simulator or local `tollgate-gateway` mode)_
 - **Live `onyx-1` Realm (`gnoweb`):** https://onyx.testnets.gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2
 - **Live `onyx-1` Pure Package:** https://onyx.testnets.gno.land/p/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate
 - **GPAS Verification (`passed`):** https://gpas.onyx.testnets.gno.land/?path=gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2
-- **HD Demo Video (1080p MP4, 2m15s):** https://github.com/mevlanayalcin/tollgate/releases/download/v1.0.0/tollgate-demo-1080p.mp4
+- **HD Demo Video (1080p MP4, 2m15s):** https://mevlanayalcin.github.io/tollgate/tollgate-demo-1080p.mp4
 - **Self-Published Static Analysis Certificate (Author's Companion Analyzer `r/.../ironclad` #6 — Grade A+ 100/100):** https://onyx.testnets.gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/ironclad:attestation/6 _(independently reproducible via `ironclad scan --remote https://rpc.onyx.testnets.gno.land:443 gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2`)_
 
 ## Live `onyx-1` On-Chain Proofs (`v1.8.0-rc.1` toolchain)
