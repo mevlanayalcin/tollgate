@@ -2,6 +2,7 @@ package tollgate
 
 import (
 	"context"
+	"errors"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -179,5 +180,54 @@ func TestMiddlewareAllThreeRailsWithEd25519AndStockX402(t *testing.T) {
 	n, err := mw.FlushSettlements(context.Background())
 	if err != nil || n != 3 || len(subm.submitted) != 3 {
 		t.Fatalf("FlushSettlements failed: n=%d err=%v", n, err)
+	}
+}
+
+type selectiveFailSubmitter struct {
+	failNonce string
+	calls     int
+}
+
+func (s *selectiveFailSubmitter) SubmitReceipt(_ context.Context, r PendingReceipt) (string, error) {
+	s.calls++
+	if r.Nonce == s.failNonce {
+		return "", errors.New("tollgate: pass expired; claims closed")
+	}
+	return "tx-ok-" + r.Nonce, nil
+}
+
+func TestFlushSettlementsDeadLetterDoesNotBlockQueue(t *testing.T) {
+	sub := &selectiveFailSubmitter{failNonce: "bad-1"}
+	mw := NewMiddleware(MiddlewareConfig{
+		ChainID:   "onyx-1",
+		RealmPath: "gno.land/r/test/tollgate",
+		Submitter: sub,
+	})
+	mw.mu.Lock()
+	mw.receipts = []PendingReceipt{
+		{Rail: "metered-pass", PassID: 1, AmountUgnot: 1000, Nonce: "bad-1"},
+		{Rail: "metered-pass", PassID: 1, AmountUgnot: 2000, Nonce: "good-2"},
+	}
+	mw.localDebits[1] = 3000
+	mw.mu.Unlock()
+
+	settled, err := mw.FlushSettlements(context.Background())
+	if err == nil {
+		t.Fatalf("expected error from bad-1, got nil")
+	}
+	if settled != 1 {
+		t.Fatalf("expected good-2 to still settle (1), got %d", settled)
+	}
+	recs := mw.Receipts()
+	if !recs[0].DeadLetter || recs[0].Settled {
+		t.Fatalf("expected bad-1 to be dead-lettered, got %+v", recs[0])
+	}
+	if !recs[1].Settled || recs[1].TxHash != "tx-ok-good-2" {
+		t.Fatalf("expected good-2 settled, got %+v", recs[1])
+	}
+	// Second flush should skip dead-lettered bad-1 cleanly
+	settled2, err2 := mw.FlushSettlements(context.Background())
+	if err2 != nil || settled2 != 0 || sub.calls != 2 {
+		t.Fatalf("expected dead-lettered receipt skipped on retry: settled2=%d err2=%v calls=%d", settled2, err2, sub.calls)
 	}
 }

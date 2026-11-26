@@ -160,8 +160,10 @@ func TestEd25519VoucherOverflowBoundsAndGnowebLinks(cur realm, t *testing.T) {
 		RecordX402Receipt(cross(cur), sid, buyer, 1, maxInt64, "vandal-1", resHash, "0xabcdef1234567890")
 	})
 
-	// Ed25519 voucher pass: forged signature rejected on-chain!
-	const testPubHex = "0d853fa898a07eb91f618bb3e8b738b0e45be9b3053799a2c42f8204f5fa3505"
+	// Ed25519 voucher pass & subscription: forged signature rejected, REAL buyer signature accepted on-chain!
+	const testPubHex = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664"
+	const validPassSig = "48cd3256dd26d8806bf487b48bfde5cf9d5e220dc72578a71f64fcbd7faa6842156aa0846aaa26a636f71536f64e6086b76f4b2f12d0fd589c8e21bb049ace02"
+	const validSubSig = "5ea5380af1986d921cb8d0fb65b0021d4fa3b94fb1570e2f57e5e990e0730ac262972aa9627a3c880cfe94bdc8e22334f41999c3daaa0ab74da8e5c6c81cdf0c"
 	testing.SetRealm(testing.NewUserRealm(buyer))
 	testing.SetOriginSend(chain.NewCoins(chain.NewCoin("ugnot", 5000)))
 	pid := OpenPass(cross(cur), sid, 500, 100, testPubHex)
@@ -170,12 +172,33 @@ func TestEd25519VoucherOverflowBoundsAndGnowebLinks(cur realm, t *testing.T) {
 	uassert.AbortsWithMessage(t, cur, "tollgate: invalid Ed25519 buyer voucher signature", func() {
 		ClaimSettlement(cross(cur), pid, 2, "forged-1", resHash, strings.Repeat("00", 64))
 	})
+	stID := ClaimSettlement(cross(cur), pid, 2, "valid-pass-1", resHash, validPassSig)
+	st, ok := GetSettlement(stID)
+	urequire.True(t, ok)
+	uassert.Equal(t, StatusPending, st.Status)
+	passRec, ok := GetReceipt(1)
+	urequire.True(t, ok)
+	uassert.True(t, passRec.BuyerSigned)
 
-	// Subscription quota wraparound rejected
+	// Ed25519 voucher subscription: forged rejected, valid accepted, quota wraparound rejected
 	testing.SetRealm(testing.NewUserRealm(buyer))
 	testing.SetOriginSend(chain.NewCoins(chain.NewCoin("ugnot", 5000)))
-	subID := Subscribe(cross(cur), sid, "")
+	subID := Subscribe(cross(cur), sid, testPubHex)
 	uassert.False(t, CheckSubscriptionActive(subID, maxInt64))
+
+	testing.SetRealm(testing.NewUserRealm(provider))
+	uassert.AbortsWithMessage(t, cur, "tollgate: invalid Ed25519 buyer voucher signature", func() {
+		ConsumeSubscription(cross(cur), subID, 3, "forged-sub-1", resHash, strings.Repeat("00", 64))
+	})
+	subRecID := ConsumeSubscription(cross(cur), subID, 3, "valid-sub-1", resHash, validSubSig)
+	subRec, ok := GetReceipt(subRecID)
+	urequire.True(t, ok)
+	uassert.True(t, subRec.BuyerSigned)
+
+	// Not-found pages include clean back links without leading-colon syntax
+	uassert.True(t, strings.Contains(Render("pass/999"), "[Back to Home](/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate)"))
+	uassert.True(t, strings.Contains(Render("sub/999"), "[Back to Home](/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate)"))
+	uassert.True(t, strings.Contains(Render("receipt/999"), "[Back to Home](/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate)"))
 
 	// P0 #1: All gnoweb links use full /r/... path (zero broken leading `](:` links!)
 	home := Render("")

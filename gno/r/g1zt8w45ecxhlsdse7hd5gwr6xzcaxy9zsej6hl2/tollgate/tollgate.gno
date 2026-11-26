@@ -565,7 +565,7 @@ func ConsumeSubscription(
 	if cur.Previous().Address() != svc.owner {
 		panic("tollgate: only service owner may consume subscription quota")
 	}
-	if runtime.ChainHeight() > sub.expiryHeight {
+	if runtime.ChainHeight() >= sub.expiryHeight {
 		panic("tollgate: subscription expired")
 	}
 	// P0 #4: Overflow-safe quota check (never wraps negative).

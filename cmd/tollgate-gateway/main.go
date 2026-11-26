@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -32,7 +33,8 @@ func main() {
 	webDir := flag.String("web", "web", "Static web playground directory")
 	stateFile := flag.String("state-file", "", "Optional JSON file to persist used nonces and unsettled receipts")
 	requireAuth := flag.Bool("require-auth", true, "Require Ed25519 buyer voucher signatures on pass and subscription rails")
-	autoSettle := flag.Duration("auto-settle", 0, "Optional background on-chain settlement flush interval (e.g. 15s; 0 disables timer)")
+	autoSettle := flag.Duration("auto-settle", 15*time.Second, "Background on-chain settlement flush interval when settler is configured (0 disables timer)")
+	adminToken := flag.String("admin-token", "", "Optional bearer token for /api/settle-now and /api/explorer/pending-receipts (when empty, restricted to loopback callers)")
 	gnokeyBin := flag.String("gnokey-bin", "", "Path to gnokey binary to enable on-chain settlement submission")
 	keyName := flag.String("key-name", "deployer", "gnokey key name for provider settlement txs")
 	keyHome := flag.String("key-home", "", "gnokey home directory")
@@ -209,11 +211,43 @@ func main() {
 		writeJSON(w, http.StatusOK, rec)
 	})
 
+	authorizeAdmin := func(r *http.Request) bool {
+		if *adminToken != "" {
+			if r.Header.Get("X-Tollgate-Admin-Token") == *adminToken ||
+				r.Header.Get("Authorization") == "Bearer "+*adminToken {
+				return true
+			}
+			return false
+		}
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		ip := net.ParseIP(host)
+		return ip != nil && ip.IsLoopback()
+	}
+
+	redactedReceipts := func() []tollgate.PendingReceipt {
+		recs := mw.Receipts()
+		for i := range recs {
+			recs[i].BuyerSigHex = ""
+		}
+		return recs
+	}
+
 	rootMux.HandleFunc("GET /api/explorer/pending-receipts", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, mw.Receipts())
+		if !authorizeAdmin(r) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin endpoint restricted to loopback or --admin-token"})
+			return
+		}
+		writeJSON(w, http.StatusOK, redactedReceipts())
 	})
 
 	rootMux.HandleFunc("POST /api/settle-now", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeAdmin(r) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin endpoint restricted to loopback or --admin-token"})
+			return
+		}
 		if submitter == nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 				"error": "on-chain settler not configured (pass --gnokey-bin, --key-home, --key-pass-file)",
@@ -225,13 +259,13 @@ func main() {
 			writeJSON(w, http.StatusBadGateway, map[string]any{
 				"settled":  n,
 				"error":    err.Error(),
-				"receipts": mw.Receipts(),
+				"receipts": redactedReceipts(),
 			})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"settled":  n,
-			"receipts": mw.Receipts(),
+			"receipts": redactedReceipts(),
 		})
 	})
 
@@ -323,6 +357,10 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/settle-now" || r.URL.Path == "/api/explorer/pending-receipts" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, PAYMENT-SIGNATURE, X-Tollgate-Pass, X-Tollgate-Sub, X-Tollgate-Units, X-Tollgate-Nonce, X-Tollgate-Voucher-Sig")

@@ -129,7 +129,7 @@ func renderHome() string {
 	if services.Size() == 0 {
 		b.WriteString("_No services registered yet._\n\n")
 	} else {
-		b.WriteString("| ID | Slug | Name | Unit Price | Sub Plan | Calls | Escrowed Rev | x402 Attested | Status |\n|---|---|---|---|---|---|---|---|---|\n")
+		b.WriteString("| ID | Slug | Name | Unit Price | Sub Plan | Calls | On-Chain Rev | x402 Attested | Status |\n|---|---|---|---|---|---|---|---|---|\n")
 		services.ReverseIterateByOffset(0, maxRenderRows, func(_ string, v any) bool {
 			s := v.(*serviceRecord)
 			status := StatusActive
@@ -202,7 +202,7 @@ func renderServices() string {
 		b.WriteString("_No services registered yet._\n")
 		return b.String()
 	}
-	b.WriteString("| ID | Slug | Name | Endpoint | Unit Price | Challenge | Escrowed Rev | x402 Attested |\n|---|---|---|---|---|---|---|---|\n")
+	b.WriteString("| ID | Slug | Name | Endpoint | Unit Price | Challenge | On-Chain Rev | x402 Attested |\n|---|---|---|---|---|---|---|---|\n")
 	services.ReverseIterateByOffset(0, maxRenderRows, func(_ string, v any) bool {
 		s := v.(*serviceRecord)
 		b.WriteString(ufmt.Sprintf(
@@ -320,7 +320,7 @@ func renderServiceDetail(rawID string) string {
 	b.WriteString(ufmt.Sprintf("| Subscription | `%d ugnot` for `%d` calls / `%d` blocks |\n", svc.subPriceUgnot, svc.subQuota, svc.subBlocks))
 	b.WriteString(ufmt.Sprintf("| Challenge Window | `%d` blocks |\n", svc.challengeBlocks))
 	b.WriteString(ufmt.Sprintf("| Total Metered Calls | `%d` |\n", svc.totalCalls))
-	b.WriteString(ufmt.Sprintf("| Escrowed On-Chain Revenue | `%d ugnot` |\n", svc.escrowedRevenue))
+	b.WriteString(ufmt.Sprintf("| On-Chain Revenue (settled passes + subscriptions) | `%d ugnot` |\n", svc.escrowedRevenue))
 	b.WriteString(ufmt.Sprintf("| External x402 Revenue _(provider-attested)_ | `%d ugnot` |\n", svc.x402AttestedRevenue))
 	b.WriteString("| x402 Invoice Memo | `" + memoExample + "` |\n")
 	return b.String()
@@ -329,11 +329,11 @@ func renderServiceDetail(rawID string) string {
 func renderPassDetail(rawID string) string {
 	id, err := strconv.ParseUint(rawID, 10, 64)
 	if err != nil {
-		return "# Pass Not Found\n\nInvalid pass ID " + sanitize.InlineCode(rawID) + ".\n"
+		return "# Pass Not Found\n\nInvalid pass ID " + sanitize.InlineCode(rawID) + ".\n\n[Back to Home](" + rlink("") + ")\n"
 	}
 	p, ok := GetPass(id)
 	if !ok {
-		return "# Pass Not Found\n\nPass " + sanitize.InlineCode(rawID) + " does not exist.\n"
+		return "# Pass Not Found\n\nPass " + sanitize.InlineCode(rawID) + " does not exist.\n\n[Back to Home](" + rlink("") + ")\n"
 	}
 	status := StatusActive
 	if p.Closed {
@@ -377,11 +377,11 @@ func renderPassDetail(rawID string) string {
 func renderSubDetail(rawID string) string {
 	id, err := strconv.ParseUint(rawID, 10, 64)
 	if err != nil {
-		return "# Subscription Not Found\n"
+		return "# Subscription Not Found\n\n[Back to Home](" + rlink("") + ")\n"
 	}
 	s, ok := GetSubscription(id)
 	if !ok {
-		return "# Subscription Not Found\n"
+		return "# Subscription Not Found\n\n[Back to Home](" + rlink("") + ")\n"
 	}
 	state := "expired"
 	if s.Active {
@@ -408,12 +408,12 @@ func renderReceiptDetail(rawID string) string {
 		if v := receiptHashIndex.Get(rawID); v != nil {
 			id = v.(uint64)
 		} else {
-			return "# Receipt Not Found\n\nUnknown receipt " + sanitize.InlineCode(rawID) + ".\n"
+			return "# Receipt Not Found\n\nUnknown receipt " + sanitize.InlineCode(rawID) + ".\n\n[Back to Home](" + rlink("") + ")\n"
 		}
 	}
 	r, ok := GetReceipt(id)
 	if !ok {
-		return "# Receipt Not Found\n"
+		return "# Receipt Not Found\n\n[Back to Home](" + rlink("") + ")\n"
 	}
 	svcStr := strconv.FormatUint(r.ServiceID, 10)
 	var b strings.Builder

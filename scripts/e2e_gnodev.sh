@@ -119,7 +119,7 @@ echo "[4/8] Starting live tollgate-gateway with Ed25519 auth, persistent state, 
   --unit-price 1000 \
   --web "$ROOT/web" \
   --state-file "$STATE_FILE" \
-  --require-auth=true \
+  --require-auth=true --auto-settle=0 \
   --gnokey-bin "$BIN/gnokey" \
   --key-name deployer \
   --key-home "$KEYHOME" \

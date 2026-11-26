@@ -8,7 +8,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
+	"math"
 	"net/http"
+	"strings"
 	"os"
 	"strconv"
 	"sync"
@@ -41,6 +44,9 @@ type PendingReceipt struct {
 	BuyerSigHex  string    `json:"buyerSigHex,omitempty"`
 	TxHash       string    `json:"txHash,omitempty"`
 	Settled      bool      `json:"settled"`
+	DeadLetter   bool      `json:"deadLetter,omitempty"`
+	Attempts     int       `json:"attempts,omitempty"`
+	LastError    string    `json:"lastError,omitempty"`
 	CreatedAt    time.Time `json:"createdAt"`
 }
 
@@ -69,6 +75,7 @@ type persistedState struct {
 type Middleware struct {
 	cfg           MiddlewareConfig
 	mu            sync.Mutex
+	flushMu       sync.Mutex
 	usedNonces    map[string]bool
 	localDebits   map[uint64]int64
 	localSubUsage map[uint64]int64
@@ -105,7 +112,7 @@ func (m *Middleware) loadState() {
 	}
 	m.receipts = st.Receipts
 	for _, r := range m.receipts {
-		if !r.Settled {
+		if !r.Settled && !r.DeadLetter {
 			if r.Rail == "metered-pass" && r.PassID > 0 {
 				m.localDebits[r.PassID] += r.AmountUgnot
 			} else if r.Rail == "subscription" && r.SubID > 0 {
@@ -127,8 +134,12 @@ func (m *Middleware) saveStateLocked() {
 		return
 	}
 	tmp := m.cfg.StateFile + ".tmp"
-	if os.WriteFile(tmp, raw, 0600) == nil {
-		_ = os.Rename(tmp, m.cfg.StateFile)
+	if err := os.WriteFile(tmp, raw, 0600); err != nil {
+		log.Printf("tollgate: state write error (%s): %v", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, m.cfg.StateFile); err != nil {
+		log.Printf("tollgate: state rename error (%s): %v", m.cfg.StateFile, err)
 	}
 }
 
@@ -142,32 +153,76 @@ func (m *Middleware) Receipts() []PendingReceipt {
 
 // FlushSettlements submits all unsettled receipts on-chain via cfg.Submitter and
 // reconciles localDebits / localSubUsage once confirmed on-chain.
+func isPermanentSettlementError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, pat := range []string{
+		"already used", "expired", "is closed", "invalid buyer",
+		"not found", "invalid ed25519", "out of bounds", "exceeds",
+	} {
+		if strings.Contains(msg, pat) {
+			return true
+		}
+	}
+	return false
+}
+
+// FlushSettlements serializes on-chain settlement submission, skips dead-lettered
+// receipts, and continues past individual errors so one bad receipt never stalls the queue.
 func (m *Middleware) FlushSettlements(ctx context.Context) (int, error) {
 	if m.cfg.Submitter == nil {
 		return 0, nil
 	}
+	m.flushMu.Lock()
+	defer m.flushMu.Unlock()
+
 	m.mu.Lock()
 	var todo []int
 	for i := range m.receipts {
-		if !m.receipts[i].Settled {
+		if !m.receipts[i].Settled && !m.receipts[i].DeadLetter {
 			todo = append(todo, i)
 		}
 	}
 	m.mu.Unlock()
 
 	settledCount := 0
+	var firstErr error
 	for _, idx := range todo {
 		m.mu.Lock()
+		if m.receipts[idx].Settled || m.receipts[idx].DeadLetter {
+			m.mu.Unlock()
+			continue
+		}
 		rec := m.receipts[idx]
 		m.mu.Unlock()
 
 		txHash, err := m.cfg.Submitter.SubmitReceipt(ctx, rec)
 		if err != nil {
-			return settledCount, err
+			if firstErr == nil {
+				firstErr = err
+			}
+			m.mu.Lock()
+			m.receipts[idx].Attempts++
+			m.receipts[idx].LastError = err.Error()
+			if m.receipts[idx].Attempts >= 3 || isPermanentSettlementError(err) {
+				m.receipts[idx].DeadLetter = true
+				if rec.Rail == "metered-pass" && m.localDebits[rec.PassID] >= rec.AmountUgnot {
+					m.localDebits[rec.PassID] -= rec.AmountUgnot
+				}
+				if rec.Rail == "subscription" && m.localSubUsage[rec.SubID] >= rec.Units {
+					m.localSubUsage[rec.SubID] -= rec.Units
+				}
+			}
+			m.saveStateLocked()
+			m.mu.Unlock()
+			continue
 		}
 		m.mu.Lock()
 		if !m.receipts[idx].Settled {
 			m.receipts[idx].Settled = true
+			m.receipts[idx].LastError = ""
 			if txHash != "" {
 				m.receipts[idx].TxHash = txHash
 			}
@@ -182,7 +237,7 @@ func (m *Middleware) FlushSettlements(ctx context.Context) (int, error) {
 		}
 		m.mu.Unlock()
 	}
-	return settledCount, nil
+	return settledCount, firstErr
 }
 
 type bufferedResponse struct {
@@ -411,7 +466,7 @@ func (m *Middleware) handlePass(
 		http.Error(w, `{"error":"invalid charge computation"}`, http.StatusBadRequest)
 		return
 	}
-	if charge.NetUgnot > pass.MaxPerCallUgnot*units {
+	if pass.MaxPerCallUgnot <= 0 || (pass.MaxPerCallUgnot <= math.MaxInt64/units && charge.NetUgnot > pass.MaxPerCallUgnot*units) {
 		m.write402(w, r, spec, units, nonce, "charge exceeds pass maxPerCallUgnot ceiling")
 		return
 	}
