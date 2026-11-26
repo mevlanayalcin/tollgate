@@ -15,12 +15,12 @@ echo "=== 1. Verify /r/tollgate/v2 is live on onyx-1 RPC ==="
 
 echo "=== 2. Generate SEPARATE PayWord SHA-256 chains for pass & subscription ==="
 PASS_KP=$("$ROOT/bin/tollgate-agent" keygen --chain-id "$CHAIN_ID" --depth 1000)
-PASS_ANCHOR=$(echo "$PASS_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)[anchorHex])")
-PASS_SEED=$(echo "$PASS_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)[seedHex])")
+PASS_ANCHOR=$(echo "$PASS_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)['anchorHex'])")
+PASS_SEED=$(echo "$PASS_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)['seedHex'])")
 
 SUB_KP=$("$ROOT/bin/tollgate-agent" keygen --chain-id "$CHAIN_ID" --depth 1000)
-SUB_ANCHOR=$(echo "$SUB_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)[anchorHex])")
-SUB_SEED=$(echo "$SUB_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)[seedHex])")
+SUB_ANCHOR=$(echo "$SUB_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)['anchorHex'])")
+SUB_SEED=$(echo "$SUB_KP" | python3 -c "import sys,json; print(json.load(sys.stdin)['seedHex'])")
 
 printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
   -home "$KEYHOME" -insecure-password-stdin \

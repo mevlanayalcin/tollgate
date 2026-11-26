@@ -64,3 +64,7 @@ make e2e
 - **GPAS Verification:** `https://gpas.onyx.testnets.gno.land/?path=gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2`
 - **Interactive Web Explorer:** `https://mevlanayalcin.github.io/tollgate/`
 - **x402 Facilitator:** `https://facilitator.onyx.testnets.gno.land` (`gno:onyx-1`)
+
+- **HD Demo Video (1080p MP4):** [Watch / Download `tollgate-demo-1080p.mp4`](https://github.com/mevlanayalcin/tollgate/releases/download/v1.0.0/tollgate-demo-1080p.mp4)
+- **Live On-Chain Proofs (`onyx-1`):** `RegisterService` (`nP5+Osiv...`, `1422294`), `OpenPass` (`qU0c1+sl...`, `1422296`), `Subscribe` (`Wel/RCva...`, `1422298`), `ClaimSettlement` (`swm9I/8A...`, `1422300`), `ConsumeSubscription` (`9uPRWiOu...`, `1422302`), `RecordX402Receipt` (`71xFO4lD...`, `1422304`), `FinalizeSettlement` (`XP9CjvtV...`, `1422323`, `9,500 ugnot` paid).
+- **On-Chain Ironclad Audit Certificate (Grade A+ 100/100):** https://onyx.testnets.gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/ironclad:attestation/6
