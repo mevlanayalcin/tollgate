@@ -2,15 +2,11 @@ package tollgate
 
 import (
 	"context"
-	"errors"
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 )
 
@@ -19,93 +15,102 @@ type fakeChain struct {
 	sub  SubscriptionInfo
 }
 
-func (f *fakeChain) Summary(context.Context) (ChainSummary, error)                  { return ChainSummary{}, nil }
-func (f *fakeChain) Services(context.Context) ([]ServiceInfo, error)                { return nil, nil }
-func (f *fakeChain) Service(context.Context, string) (ServiceInfo, error)           { return ServiceInfo{}, nil }
-func (f *fakeChain) Receipt(context.Context, string) (ReceiptInfo, error)           { return ReceiptInfo{}, nil }
-func (f *fakeChain) Pass(context.Context, uint64) (PassInfo, error)                 { return f.pass, nil }
-func (f *fakeChain) Subscription(context.Context, uint64) (SubscriptionInfo, error) { return f.sub, nil }
-func (f *fakeChain) CheckPassQuota(context.Context, uint64, int64) (bool, error)    { return true, nil }
+func (f *fakeChain) Summary(context.Context) (ChainSummary, error) {
+	return ChainSummary{ChainID: "onyx-1", Height: 100}, nil
+}
+func (f *fakeChain) Services(context.Context) ([]ServiceInfo, error) { return nil, nil }
+func (f *fakeChain) Service(context.Context, string) (ServiceInfo, error) {
+	return ServiceInfo{ID: 1, UnitPriceUgnot: 1000}, nil
+}
+func (f *fakeChain) Pass(context.Context, uint64) (PassInfo, error) { return f.pass, nil }
+func (f *fakeChain) Subscription(context.Context, uint64) (SubscriptionInfo, error) {
+	return f.sub, nil
+}
+func (f *fakeChain) Receipt(context.Context, string) (ReceiptInfo, error) {
+	return ReceiptInfo{}, nil
+}
+func (f *fakeChain) CheckPassQuota(context.Context, uint64, int64) (bool, error) {
+	return true, nil
+}
 func (f *fakeChain) CheckSubscriptionActive(context.Context, uint64, int64) (bool, error) {
-	return f.sub.Active, nil
+	return true, nil
 }
 
-type strictMemoFacilitator struct {
-	lastVerifiedMemo string
+type fakeFac struct{}
+
+func (f *fakeFac) Verify(context.Context, string, PaymentRequirements) (VerifyResponse, error) {
+	return VerifyResponse{IsValid: true, Payer: "g1payer000000000000000000000000000000000"}, nil
+}
+func (f *fakeFac) Settle(context.Context, string, PaymentRequirements) (SettleResponse, error) {
+	return SettleResponse{Success: true, Transaction: "0xdeadbeef12345678", Payer: "g1payer000000000000000000000000000000000"}, nil
 }
 
-func (f *strictMemoFacilitator) Verify(_ context.Context, paymentHeader string, req PaymentRequirements) (VerifyResponse, error) {
-	memo, _ := ExtractX402AcceptedMemo(paymentHeader)
-	if req.Extra["memo"] != memo {
-		return VerifyResponse{IsValid: false, InvalidReason: "invalid_exact_gno_payload_memo_mismatch"}, nil
-	}
-	f.lastVerifiedMemo = memo
-	return VerifyResponse{IsValid: true, Payer: "g1x402buyer00000000000000000000000000000"}, nil
+type fakeSubmitter struct {
+	submitted []PendingReceipt
 }
-func (f *strictMemoFacilitator) Settle(context.Context, string, PaymentRequirements) (SettleResponse, error) {
-	return SettleResponse{
-		Success:     true,
-		Transaction: "0x1234567890abcdef",
-		Network:     "gno:onyx-1",
-		Payer:       "g1x402buyer00000000000000000000000000000",
-	}, nil
-}
-
-type fakeSubmitter struct{ submitted []PendingReceipt }
 
 func (s *fakeSubmitter) SubmitReceipt(_ context.Context, r PendingReceipt) (string, error) {
 	s.submitted = append(s.submitted, r)
-	return "txhash-" + r.Nonce, nil
+	return "tx-" + r.Nonce, nil
 }
 
-func TestMiddlewareAllThreeRailsWithEd25519AndStockX402(t *testing.T) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+func TestMiddlewareAllThreeRailsWithPayWordAndStockX402(t *testing.T) {
+	seed := HashResource("tollgate-middleware-test-seed")
+	pwChain, err := BuildPayWordChain("onyx-1", seed, 100)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("build payword chain: %v", err)
 	}
-	pubHex := hex.EncodeToString(pub)
+	anchorHex := pwChain.AnchorHex()
 
-	chain := &fakeChain{
+	fc := &fakeChain{
 		pass: PassInfo{
-			ID: 7, ServiceID: 1, Buyer: "g1passbuyer0000000000000000000000000000",
-			DepositUgnot: 25000, AvailableUgnot: 25000, MaxPerCallUgnot: 2000,
-			ExpiryHeight: 500, CurrentHeight: 100, VoucherPubKey: pubHex,
+			ID:              7,
+			ServiceID:       1,
+			Buyer:           "g1buyer000000000000000000000000000000000",
+			AvailableUgnot:  50000,
+			MaxPerCallUgnot: 2000,
+			ExpiryHeight:    500,
+			CurrentHeight:   100,
+			VoucherPubKey:   anchorHex,
 		},
 		sub: SubscriptionInfo{
-			ID: 3, ServiceID: 1, Buyer: "g1subbuyer00000000000000000000000000000",
-			QuotaTotal: 50, QuotaRemaining: 50, Active: true, VoucherPubKey: pubHex,
+			ID:             3,
+			ServiceID:      1,
+			Buyer:          "g1buyer000000000000000000000000000000000",
+			Active:         true,
+			QuotaTotal:     100,
+			QuotaRemaining: 80,
+			ExpiryHeight:   500,
+			CurrentHeight:  100,
+			VoucherPubKey:  anchorHex,
 		},
 	}
-
-	fac := &strictMemoFacilitator{}
 	subm := &fakeSubmitter{}
-	statePath := filepath.Join(t.TempDir(), "state.json")
-
 	mw := NewMiddleware(MiddlewareConfig{
 		ChainID:     "onyx-1",
-		RealmPath:   "gno.land/r/test/tollgate",
-		Chain:       chain,
-		Facilitator: fac,
+		RealmPath:   "gno.land/r/test/tollgate/v2",
+		Chain:       fc,
+		Facilitator: &fakeFac{},
 		Submitter:   subm,
-		StateFile:   statePath,
 		RequireAuth: true,
 		Routes: map[string]RouteSpec{
 			"GET /v1/oracle": {
 				ServiceID:      1,
-				Slug:           "alpha-oracle",
-				Description:    "Verified market feed",
+				Slug:           "oracle",
+				Description:    "Oracle quote",
 				PayTo:          "g1prov0000000000000000000000000000000000",
 				UnitPriceUgnot: 1000,
+				MimeType:       "application/json",
 			},
 		},
 	})
 
 	handler := mw.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"pair":"GNOT-USD","price":1.42}`))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"price":1.42}`))
 	}))
 
-	// 1. Unpaid request -> 402 with valid PAYMENT-REQUIRED header
+	// 1. Unpaid probe returns 402 + x402 PAYMENT-REQUIRED
 	rec1 := httptest.NewRecorder()
 	handler.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/v1/oracle?pair=GNOT-USD", nil))
 	if rec1.Code != http.StatusPaymentRequired {
@@ -116,7 +121,7 @@ func TestMiddlewareAllThreeRailsWithEd25519AndStockX402(t *testing.T) {
 		t.Fatalf("decode PAYMENT-REQUIRED: %v", err)
 	}
 
-	// 2a. Unauthorized pass call (no Ed25519 voucher signature) MUST be rejected with 401!
+	// 2a. Unauthorized pass call (no PayWord preimage) MUST be rejected with 401!
 	reqBad := httptest.NewRequest(http.MethodGet, "/v1/oracle?pair=GNOT-USD", nil)
 	reqBad.Header.Set(HeaderTollgatePass, "7")
 	reqBad.Header.Set(HeaderTollgateUnits, "10")
@@ -127,14 +132,16 @@ func TestMiddlewareAllThreeRailsWithEd25519AndStockX402(t *testing.T) {
 		t.Fatalf("unauthenticated pass call expected 401, got %d", recBad.Code)
 	}
 
-	// 2b. Authenticated Ed25519 pass call succeeds
-	resHash := HashResource("GET /v1/oracle?pair=GNOT-USD")
-	sigPass := SignVoucher(priv, "onyx-1", 1, 7, 0, 10, "pass-call-1", resHash)
-	reqBad.Header.Set(HeaderTollgateVoucherSig, sigPass)
+	// 2b. Valid PayWord pass call #1 (10 units -> w_90) succeeds
+	proof10, _, err := pwChain.ProofForAnchor(anchorHex, 10)
+	if err != nil {
+		t.Fatalf("proof10: %v", err)
+	}
+	reqBad.Header.Set(HeaderTollgateVoucherSig, proof10)
 	rec2 := httptest.NewRecorder()
 	handler.ServeHTTP(rec2, reqBad)
 	if rec2.Code != http.StatusOK || rec2.Header().Get(HeaderTollgateNetUgnot) != "9500" {
-		t.Fatalf("signed pass call failed: %d %s", rec2.Code, rec2.Body.String())
+		t.Fatalf("PayWord pass call #1 failed: %d %s", rec2.Code, rec2.Body.String())
 	}
 
 	// Duplicate nonce returns 409 Conflict
@@ -144,12 +151,31 @@ func TestMiddlewareAllThreeRailsWithEd25519AndStockX402(t *testing.T) {
 		t.Fatalf("expected 409 on duplicate nonce, got %d", recDup.Code)
 	}
 
-	// 3. Authenticated subscription fast-path
-	sigSub := SignVoucher(priv, "onyx-1", 1, 0, 3, 1, "sub-call-1", resHash)
+	// 2c. Sequential PayWord pass call #2 (5 units from w_90 -> w_85) proves chained off-chain auth!
+	proofNext5, _, err := pwChain.ProofForAnchor(proof10, 5)
+	if err != nil {
+		t.Fatalf("proofNext5: %v", err)
+	}
+	req2b := httptest.NewRequest(http.MethodGet, "/v1/oracle?pair=GNOT-USD", nil)
+	req2b.Header.Set(HeaderTollgatePass, "7")
+	req2b.Header.Set(HeaderTollgateUnits, "5")
+	req2b.Header.Set(HeaderTollgateNonce, "pass-call-2")
+	req2b.Header.Set(HeaderTollgateVoucherSig, proofNext5)
+	rec2b := httptest.NewRecorder()
+	handler.ServeHTTP(rec2b, req2b)
+	if rec2b.Code != http.StatusOK || rec2b.Header().Get(HeaderTollgateNetUgnot) != "5000" {
+		t.Fatalf("PayWord chained pass call #2 failed: %d %s", rec2b.Code, rec2b.Body.String())
+	}
+
+	// 3. Authenticated subscription fast-path (1 unit -> w_99)
+	proofSub1, _, err := pwChain.ProofForAnchor(anchorHex, 1)
+	if err != nil {
+		t.Fatalf("proofSub1: %v", err)
+	}
 	req3 := httptest.NewRequest(http.MethodGet, "/v1/oracle?pair=GNOT-USD", nil)
 	req3.Header.Set(HeaderTollgateSub, "3")
 	req3.Header.Set(HeaderTollgateNonce, "sub-call-1")
-	req3.Header.Set(HeaderTollgateVoucherSig, sigSub)
+	req3.Header.Set(HeaderTollgateVoucherSig, proofSub1)
 	rec3 := httptest.NewRecorder()
 	handler.ServeHTTP(rec3, req3)
 	if rec3.Code != http.StatusOK || rec3.Header().Get(HeaderTollgateRail) != "subscription" {
@@ -169,16 +195,15 @@ func TestMiddlewareAllThreeRailsWithEd25519AndStockX402(t *testing.T) {
 	if rec4.Code != http.StatusOK || rec4.Header().Get(HeaderTollgateRail) != "x402-direct" {
 		t.Fatalf("stock x402 retry failed: %d %s", rec4.Code, rec4.Body.String())
 	}
-	// Replaying the same stock x402 memo MUST return 409 Conflict
 	rec4Dup := httptest.NewRecorder()
 	handler.ServeHTTP(rec4Dup, req4)
 	if rec4Dup.Code != http.StatusConflict {
 		t.Fatalf("expected 409 on x402 replay, got %d", rec4Dup.Code)
 	}
 
-	// 5. Real FlushSettlements submits all 3 receipts and reconciles debits
+	// 5. Real FlushSettlements submits all 4 receipts and reconciles debits
 	n, err := mw.FlushSettlements(context.Background())
-	if err != nil || n != 3 || len(subm.submitted) != 3 {
+	if err != nil || n != 4 || len(subm.submitted) != 4 {
 		t.Fatalf("FlushSettlements failed: n=%d err=%v", n, err)
 	}
 }
@@ -200,7 +225,7 @@ func TestFlushSettlementsDeadLetterDoesNotBlockQueue(t *testing.T) {
 	sub := &selectiveFailSubmitter{failNonce: "bad-1"}
 	mw := NewMiddleware(MiddlewareConfig{
 		ChainID:   "onyx-1",
-		RealmPath: "gno.land/r/test/tollgate",
+		RealmPath: "gno.land/r/test/tollgate/v2",
 		Submitter: sub,
 	})
 	mw.mu.Lock()
@@ -225,7 +250,6 @@ func TestFlushSettlementsDeadLetterDoesNotBlockQueue(t *testing.T) {
 	if !recs[1].Settled || recs[1].TxHash != "tx-ok-good-2" {
 		t.Fatalf("expected good-2 settled, got %+v", recs[1])
 	}
-	// Second flush should skip dead-lettered bad-1 cleanly
 	settled2, err2 := mw.FlushSettlements(context.Background())
 	if err2 != nil || settled2 != 0 || sub.calls != 2 {
 		t.Fatalf("expected dead-lettered receipt skipped on retry: settled2=%d err2=%v calls=%d", settled2, err2, sub.calls)

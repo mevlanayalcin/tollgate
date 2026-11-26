@@ -9,8 +9,7 @@ import (
 	"chain/banker"
 	"chain/runtime"
 	"chain/runtime/unsafe"
-	"crypto/ed25519"
-	"encoding/hex"
+	"crypto/sha256"
 	"strconv"
 	"strings"
 
@@ -25,16 +24,25 @@ func mustCurrent(cur realm) {
 	}
 }
 
-func mustDirectUserPayment(cur realm) int64 {
-	mustCurrent(cur)
+func readDirectUgnot(cur realm) int64 {
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	if !cur.Previous().IsUserCall() {
 		panic("tollgate: payment must be a direct user call")
 	}
-	sent := unsafe.OriginSend().AmountOf("ugnot")
-	if sent <= 0 {
+	sent := unsafe.OriginSend()
+	var total int64
+	for _, c := range sent {
+		if c.Denom != "ugnot" {
+			panic("tollgate: only ugnot is accepted")
+		}
+		total = satAdd(total, c.Amount)
+	}
+	if total <= 0 {
 		panic("tollgate: positive ugnot payment required")
 	}
-	return sent
+	return total
 }
 
 // satAdd prevents silent int64 wraparound on telemetry/revenue accumulators.
@@ -92,22 +100,40 @@ func VoucherMessage(
 	return b.String()
 }
 
-func verifyBuyerVoucher(pubKeyHex string, sigHex string, msg string) bool {
-	if !ptollgate.IsValidHexDigest(pubKeyHex) {
+const maxPayWordSteps int64 = 1024
+
+func hexEncode32(sum [32]byte) string {
+	const digits = "0123456789abcdef"
+	var out [64]byte
+	for i := 0; i < 32; i++ {
+		out[2*i] = digits[sum[i]>>4]
+		out[2*i+1] = digits[sum[i]&0x0f]
+	}
+	return string(out[:])
+}
+
+// PayWordStep advances a Rivest-Shamir PayWord SHA-256 hash-chain voucher by 1 unit.
+func PayWordStep(chainID string, prevHex string) string {
+	sum := sha256.Sum256([]byte("tollgate-payword-v1|" + chainID + "|" + prevHex))
+	return hexEncode32(sum)
+}
+
+func verifyPayWord(chainID string, anchorHex string, preimageHex string, steps int64) bool {
+	if steps <= 0 || steps > maxPayWordSteps {
 		return false
 	}
-	if len(sigHex) != 128 {
+	if !ptollgate.IsValidHexDigest(anchorHex) || !ptollgate.IsValidHexDigest(preimageHex) {
 		return false
 	}
-	pub, err := hex.DecodeString(pubKeyHex)
-	if err != nil || len(pub) != 32 {
-		return false
+	cur := preimageHex
+	for i := int64(0); i < steps; i++ {
+		cur = PayWordStep(chainID, cur)
 	}
-	sig, err := hex.DecodeString(sigHex)
-	if err != nil || len(sig) != 64 {
-		return false
+	var diff byte
+	for i := 0; i < 64; i++ {
+		diff |= cur[i] ^ anchorHex[i]
 	}
-	return ed25519.Verify(pub, []byte(msg), sig)
+	return diff == 0
 }
 
 func validateOptionalPubKey(pubKeyHex string) string {
@@ -190,7 +216,9 @@ func RegisterService(
 	challengeBlocks int64,
 	description string,
 ) uint64 {
-	mustCurrent(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	owner := cur.Previous().Address()
 
 	slug = strings.TrimSpace(slug)
@@ -268,7 +296,9 @@ func UpdateServicePricing(
 	subBlocks int64,
 	subQuota int64,
 ) {
-	mustCurrent(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	svc := getServiceRecord(serviceID)
 	if svc == nil {
 		panic("tollgate: service not found")
@@ -297,7 +327,9 @@ func UpdateServicePricing(
 
 // SetServicePaused pauses or unpauses new passes/subscriptions on a service.
 func SetServicePaused(cur realm, serviceID uint64, paused bool) {
-	mustCurrent(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	svc := getServiceRecord(serviceID)
 	if svc == nil {
 		panic("tollgate: service not found")
@@ -324,7 +356,13 @@ func OpenPass(
 	expiryBlocks int64,
 	voucherPubKeyHex string,
 ) uint64 {
-	sent := mustDirectUserPayment(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
+	if !cur.Previous().IsUserCall() {
+		panic("tollgate: payment must be a direct user call")
+	}
+	sent := readDirectUgnot(cur)
 	svc := getServiceRecord(serviceID)
 	if svc == nil {
 		panic("tollgate: service not found")
@@ -378,7 +416,13 @@ func OpenPass(
 
 // TopUpPass adds more ugnot and optionally extends expiry of an active pass.
 func TopUpPass(cur realm, passID uint64, extendBlocks int64) {
-	sent := mustDirectUserPayment(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
+	if !cur.Previous().IsUserCall() {
+		panic("tollgate: payment must be a direct user call")
+	}
+	sent := readDirectUgnot(cur)
 	p := getPassRecord(passID)
 	if p == nil {
 		panic("tollgate: pass not found")
@@ -416,7 +460,9 @@ func TopUpPass(cur realm, passID uint64, extendBlocks int64) {
 // RequestEarlyClose shortens a pass expiry to height + service.challengeBlocks so
 // the provider gets one bounded settlement window and cannot lock buyer funds.
 func RequestEarlyClose(cur realm, passID uint64) int64 {
-	mustCurrent(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	p := getPassRecord(passID)
 	if p == nil {
 		panic("tollgate: pass not found")
@@ -443,7 +489,9 @@ func RequestEarlyClose(cur realm, passID uint64) int64 {
 // ClosePass refunds any unspent, non-pending ugnot back to the pass buyer once
 // the pass has expired (or its service is paused) and no settlement is pending.
 func ClosePass(cur realm, passID uint64) int64 {
-	mustCurrent(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	p := getPassRecord(passID)
 	if p == nil {
 		panic("tollgate: pass not found")
@@ -489,7 +537,13 @@ func ClosePass(cur realm, passID uint64) int64 {
 // Subscribe purchases a fixed-window quota subscription, optionally binds a
 // buyer Ed25519 voucher public key, and pays the service provider immediately.
 func Subscribe(cur realm, serviceID uint64, voucherPubKeyHex string) uint64 {
-	sent := mustDirectUserPayment(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
+	if !cur.Previous().IsUserCall() {
+		panic("tollgate: payment must be a direct user call")
+	}
+	sent := readDirectUgnot(cur)
 	svc := getServiceRecord(serviceID)
 	if svc == nil {
 		panic("tollgate: service not found")
@@ -556,7 +610,9 @@ func ConsumeSubscription(
 	resourceHash string,
 	buyerSigHex string,
 ) uint64 {
-	mustCurrent(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	sub := getSubRecord(subID)
 	if sub == nil {
 		panic("tollgate: subscription not found")
@@ -585,10 +641,10 @@ func ConsumeSubscription(
 
 	buyerSigned := false
 	if sub.voucherPubKey != "" {
-		msg := VoucherMessage(runtime.ChainID(), sub.serviceID, 0, sub.id, units, nonce, resourceHash)
-		if !verifyBuyerVoucher(sub.voucherPubKey, buyerSigHex, msg) {
-			panic("tollgate: invalid Ed25519 buyer voucher signature")
+		if !verifyPayWord(runtime.ChainID(), sub.voucherPubKey, buyerSigHex, units) {
+			panic("tollgate: invalid PayWord SHA-256 buyer voucher preimage")
 		}
+		sub.voucherPubKey = buyerSigHex
 		buyerSigned = true
 	}
 
@@ -648,7 +704,9 @@ func ClaimSettlement(
 	resourceHash string,
 	buyerSigHex string,
 ) uint64 {
-	mustCurrent(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	p := getPassRecord(passID)
 	if p == nil {
 		panic("tollgate: pass not found")
@@ -680,10 +738,10 @@ func ClaimSettlement(
 
 	buyerSigned := false
 	if p.voucherPubKey != "" {
-		msg := VoucherMessage(runtime.ChainID(), svc.id, p.id, 0, units, nonce, resourceHash)
-		if !verifyBuyerVoucher(p.voucherPubKey, buyerSigHex, msg) {
-			panic("tollgate: invalid Ed25519 buyer voucher signature")
+		if !verifyPayWord(runtime.ChainID(), p.voucherPubKey, buyerSigHex, units) {
+			panic("tollgate: invalid PayWord SHA-256 buyer voucher preimage")
 		}
+		p.voucherPubKey = buyerSigHex
 		buyerSigned = true
 	}
 
@@ -774,7 +832,9 @@ func ClaimSettlement(
 
 // DisputeSettlement freezes a pending settlement inside its challenge window.
 func DisputeSettlement(cur realm, settlementID uint64, reason string) {
-	mustCurrent(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	st := getSettlementRecord(settlementID)
 	if st == nil {
 		panic("tollgate: settlement not found")
@@ -805,7 +865,9 @@ func DisputeSettlement(cur realm, settlementID uint64, reason string) {
 // RefundDisputedSettlement lets the service owner concede a disputed or pending
 // settlement, immediately releasing the locked ugnot back to the pass balance.
 func RefundDisputedSettlement(cur realm, settlementID uint64) {
-	mustCurrent(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	st := getSettlementRecord(settlementID)
 	if st == nil {
 		panic("tollgate: settlement not found")
@@ -833,7 +895,9 @@ func RefundDisputedSettlement(cur realm, settlementID uint64) {
 // from a disputed settlement if the provider does not refund within one additional
 // challenge window (st.challengeEnd + svc.challengeBlocks), preventing pass lockup.
 func ReclaimDisputedSettlement(cur realm, settlementID uint64) {
-	mustCurrent(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	st := getSettlementRecord(settlementID)
 	if st == nil {
 		panic("tollgate: settlement not found")
@@ -863,7 +927,9 @@ func ReclaimDisputedSettlement(cur realm, settlementID uint64) {
 // FinalizeSettlement releases an undisputed settlement's locked ugnot to the
 // service payTo address once the challenge window has passed.
 func FinalizeSettlement(cur realm, settlementID uint64) {
-	mustCurrent(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	st := getSettlementRecord(settlementID)
 	if st == nil {
 		panic("tollgate: settlement not found")
@@ -909,7 +975,9 @@ func RecordX402Receipt(
 	resourceHash string,
 	txHash string,
 ) uint64 {
-	mustCurrent(cur)
+	if !cur.IsCurrent() {
+		panic("tollgate: spoofed realm capability")
+	}
 	svc := getServiceRecord(serviceID)
 	if svc == nil {
 		panic("tollgate: service not found")
@@ -1196,6 +1264,6 @@ func CheckSubscriptionActive(subID uint64, units int64) bool {
 
 // VaultBalanceUgnot returns the live ugnot locked in this realm using O(1) GetCoin.
 func VaultBalanceUgnot() int64 {
-	pkgAddr := chain.PackageAddress(runtime.ChainDomain() + "/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate")
+	pkgAddr := chain.PackageAddress("gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2")
 	return banker.NewReadonlyBanker().GetCoin(pkgAddr, "ugnot")
 }

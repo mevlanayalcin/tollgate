@@ -7,10 +7,10 @@ import {
   hashResource,
   receiptCommitment,
   verifyReceiptCommitment,
-  voucherMessage,
-  generateVoucherKeypair,
-  signVoucher,
-  verifyVoucher,
+  payWordStep,
+  buildPayWordChain,
+  payWordProofForAnchor,
+  verifyPayWord,
   decodePaymentRequired,
 } from "./index.ts";
 
@@ -47,31 +47,21 @@ test("canonical receipt commitment matches Gno and Go SDKs byte-for-byte", () =>
   assert.equal(commitment, "cfdf0dc69056f30d26543f18accf341c2f44d65fcd86a72a21f845c66010eafc");
 });
 
-test("Ed25519 voucher message, signing, verification, and tamper rejection", () => {
-  const kp = generateVoucherKeypair();
-  assert.equal(kp.publicKeyHex.length, 64);
-  assert.equal(kp.seedHex.length, 64);
+test("PayWord SHA-256 hash-chain matches Gno & Go SDKs and rejects overcharge/replay", () => {
+  const seed = hashResource("tollgate-payword-test-seed");
+  const chain = buildPayWordChain("dev", 10, seed);
+  assert.equal(chain.anchorHex.length, 64);
+  assert.equal(payWordStep("dev", chain.hashes[9]), chain.anchorHex);
 
-  const resHash = hashResource("GET /api/v1/oracle?pair=GNOT-USD");
-  const params = {
-    chainId: "onyx-1",
-    serviceId: 1n,
-    passId: 1n,
-    subId: 0n,
-    units: 10n,
-    nonce: "ts-voucher-001",
-    resourceHash: resHash,
-  };
-  assert.equal(
-    voucherMessage(params),
-    `tollgate-voucher-v1|6:onyx-1|1|1|0|10|14:ts-voucher-001|64:${resHash}|`
-  );
-
-  const sig = signVoucher(kp.seedHex, params);
-  assert.equal(sig.length, 128);
-  assert.equal(verifyVoucher(kp.publicKeyHex, sig, params), true);
-  assert.equal(verifyVoucher(kp.publicKeyHex, sig, { ...params, units: 11n }), false);
-  assert.equal(verifyVoucher(kp.publicKeyHex, sig, { ...params, nonce: "ts-voucher-002" }), false);
+  const proof2 = payWordProofForAnchor(chain.hashes, chain.anchorHex, 2);
+  assert.equal(verifyPayWord("dev", chain.anchorHex, proof2, 2n), true);
+  // Overcharge (+1 unit) must fail
+  assert.equal(verifyPayWord("dev", chain.anchorHex, proof2, 3n), false);
+  // Wrong chainId must fail
+  assert.equal(verifyPayWord("onyx-1", chain.anchorHex, proof2, 2n), false);
+  // Next call advances cleanly from proof2
+  const proofNext3 = payWordProofForAnchor(chain.hashes, proof2, 3);
+  assert.equal(verifyPayWord("dev", proof2, proofNext3, 3n), true);
 });
 
 test("decodePaymentRequired decodes x402 v2 base64 header", () => {

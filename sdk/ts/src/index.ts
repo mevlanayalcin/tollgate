@@ -1,21 +1,11 @@
-import {
-  createHash,
-  createPrivateKey,
-  createPublicKey,
-  generateKeyPairSync,
-  sign,
-  timingSafeEqual,
-  verify,
-} from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 export const PROTOCOL_VERSION = "tollgate-v1";
 export const RECEIPT_DOMAIN = "tollgate-receipt-v1";
-export const VOUCHER_DOMAIN = "tollgate-voucher-v1";
+export const PAYWORD_DOMAIN = "tollgate-payword-v1";
+export const MAX_PAYWORD_STEPS = 1024n;
 export const MEMO_PREFIX = "tollgate:v1:";
 export const MAX_MEMO_BYTES = 256;
-
-const ED25519_PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
-const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 
 export interface ChargeBreakdown {
   units: bigint;
@@ -144,72 +134,64 @@ export function verifyReceiptCommitment(
   return timingSafeEqual(Buffer.from(got, "utf8"), Buffer.from(expectedHex, "utf8"));
 }
 
-export function voucherMessage(params: {
-  chainId: string;
-  serviceId: bigint;
-  passId: bigint;
-  subId: bigint;
-  units: bigint;
-  nonce: string;
-  resourceHash: string;
-}): string {
-  return (
-    `${VOUCHER_DOMAIN}|` +
-    lp(params.chainId) +
-    `${params.serviceId.toString()}|` +
-    `${params.passId.toString()}|` +
-    `${params.subId.toString()}|` +
-    `${params.units.toString()}|` +
-    lp(params.nonce) +
-    lp(params.resourceHash)
-  );
+/**
+ * Advances a Rivest-Shamir PayWord SHA-256 hash chain by 1 unit.
+ * Matches gno.land/r/.../tollgate/v2.PayWordStep and Go SDK byte-for-byte.
+ */
+export function payWordStep(chainId: string, prevHex: string): string {
+  return createHash("sha256")
+    .update(`${PAYWORD_DOMAIN}|${chainId}|${prevHex}`, "utf8")
+    .digest("hex");
 }
 
-export function generateVoucherKeypair(): { publicKeyHex: string; seedHex: string } {
-  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
-  const spki = publicKey.export({ format: "der", type: "spki" });
-  const pkcs8 = privateKey.export({ format: "der", type: "pkcs8" });
-  return {
-    publicKeyHex: spki.subarray(spki.length - 32).toString("hex"),
-    seedHex: pkcs8.subarray(pkcs8.length - 32).toString("hex"),
-  };
-}
-
-export function signVoucher(
-  seedOrPrivKeyHex: string,
-  params: Parameters<typeof voucherMessage>[0]
-): string {
-  const raw = Buffer.from(seedOrPrivKeyHex.trim(), "hex");
-  const seed = raw.length === 64 ? raw.subarray(0, 32) : raw;
-  if (seed.length !== 32) {
-    throw new Error("tollgate: expected 32-byte Ed25519 seed or 64-byte private key hex");
+export function buildPayWordChain(
+  chainId: string,
+  depth: number,
+  seedHex: string = randomBytes(32).toString("hex")
+): { seedHex: string; anchorHex: string; hashes: string[] } {
+  if (!/^[0-9a-f]{64}$/.test(seedHex)) {
+    throw new Error("tollgate: expected 64-char lowercase hex seed");
   }
-  const keyObj = createPrivateKey({
-    key: Buffer.concat([ED25519_PKCS8_PREFIX, seed]),
-    format: "der",
-    type: "pkcs8",
-  });
-  const msg = Buffer.from(voucherMessage(params), "utf8");
-  return sign(null, msg, keyObj).toString("hex");
+  if (!Number.isInteger(depth) || depth <= 0 || depth > 100000) {
+    throw new Error("tollgate: payword depth out of range");
+  }
+  const hashes: string[] = new Array(depth + 1);
+  hashes[0] = seedHex;
+  for (let i = 1; i <= depth; i++) {
+    hashes[i] = payWordStep(chainId, hashes[i - 1]);
+  }
+  return { seedHex, anchorHex: hashes[depth], hashes };
 }
 
-export function verifyVoucher(
-  publicKeyHex: string,
-  sigHex: string,
-  params: Parameters<typeof voucherMessage>[0]
+export function payWordProofForAnchor(
+  hashes: string[],
+  currentAnchorHex: string,
+  units: number
+): string {
+  if (!Number.isInteger(units) || units <= 0 || BigInt(units) > MAX_PAYWORD_STEPS) {
+    throw new Error("tollgate: units out of PayWord bounds");
+  }
+  const pos = hashes.lastIndexOf(currentAnchorHex);
+  if (pos < 0) throw new Error("tollgate: current anchor not found in chain");
+  if (pos - units < 0) throw new Error("tollgate: PayWord chain exhausted");
+  return hashes[pos - units];
+}
+
+export function verifyPayWord(
+  chainId: string,
+  anchorHex: string,
+  preimageHex: string,
+  steps: bigint
 ): boolean {
-  if (!/^[0-9a-f]{64}$/.test(publicKeyHex) || !/^[0-9a-f]{128}$/.test(sigHex)) {
+  if (steps <= 0n || steps > MAX_PAYWORD_STEPS) return false;
+  if (!/^[0-9a-f]{64}$/.test(anchorHex) || !/^[0-9a-f]{64}$/.test(preimageHex)) {
     return false;
   }
-  const pub = Buffer.from(publicKeyHex, "hex");
-  const sig = Buffer.from(sigHex, "hex");
-  const keyObj = createPublicKey({
-    key: Buffer.concat([ED25519_SPKI_PREFIX, pub]),
-    format: "der",
-    type: "spki",
-  });
-  const msg = Buffer.from(voucherMessage(params), "utf8");
-  return verify(null, msg, keyObj, sig);
+  let cur = preimageHex;
+  for (let i = 0n; i < steps; i++) {
+    cur = payWordStep(chainId, cur);
+  }
+  return timingSafeEqual(Buffer.from(cur, "utf8"), Buffer.from(anchorHex, "utf8"));
 }
 
 export function decodePaymentRequired(headerValue: string): PaymentRequired {
@@ -228,7 +210,7 @@ export class TollgateClient {
 
   async queryRender(subPath: string): Promise<string> {
     const dataHex = Buffer.from(`${this.realmPath}:${subPath}`, "utf8").toString("hex");
-    const url = `${this.rpcUrl}/abci_query?path=${encodeURIComponent(vm/qrender)}&data=0x${dataHex}`;
+    const url = `${this.rpcUrl}/abci_query?path=${encodeURIComponent('"vm/qrender"')}&data=0x${dataHex}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
     const body = (await res.json()) as {

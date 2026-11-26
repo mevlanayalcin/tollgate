@@ -11,7 +11,7 @@
     <header>
       <div class="brand">
         <h1>Tollgate Protocol</h1>
-        <p>On-chain HTTP 402 (<code>gnolang/x402</code>) metering vaults, Ed25519-authenticated prepaid passes, subscriptions &amp; verifiable SHA-256 receipts on Gno.land</p>
+        <p>On-chain HTTP 402 (<code>gnolang/x402</code>) metering vaults, PayWord SHA-256 hash-chain prepaid passes, subscriptions &amp; verifiable SHA-256 receipts on Gno.land</p>
       </div>
       <div class="badge-row">
         <span class="badge" id="chainBadge">chain: onyx-1</span>
@@ -27,7 +27,7 @@
         </div>
         <div class="field" style="flex:1.6">
           <label for="realmInput">Tollgate Realm Path</label>
-          <input id="realmInput" value="gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate" />
+          <input id="realmInput" value="gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2" />
         </div>
         <div class="field" style="flex:1.1">
           <label for="gatewayInput">Tollgate HTTP 402 Gateway URL (optional)</label>
@@ -51,7 +51,7 @@
     <section class="grid-2">
       <div class="card">
         <h2>Interactive HTTP 402 &amp; Dual-Rail Playground</h2>
-        <p class="muted">Probe a metered endpoint with no headers to inspect its live <code>x402 v2 PAYMENT-REQUIRED</code> offer, or attach a Tollgate Pass / Subscription header plus an Ed25519 buyer voucher signature (<code>X-Tollgate-Voucher-Sig</code>) for single-round-trip metered access with batched on-chain settlement.</p>
+        <p class="muted">Probe a metered endpoint with no headers to inspect its live <code>x402 v2 PAYMENT-REQUIRED</code> offer, or attach a Tollgate Pass / Subscription header plus an PayWord SHA-256 voucher preimage (<code>X-Tollgate-Voucher-Sig</code>) for single-round-trip metered access with batched on-chain settlement.</p>
         <div class="row">
           <div class="field">
             <label for="endpointSelect">Metered Endpoint</label>
@@ -77,8 +77,8 @@
         </div>
         <div class="row">
           <div class="field">
-            <label for="voucherSigInput">X-Tollgate-Voucher-Sig (128-char Ed25519 hex, optional if auth disabled)</label>
-            <input id="voucherSigInput" placeholder="Signed with tollgate-agent or SDK signVoucher(...)" />
+            <label for="voucherSigInput">X-Tollgate-Voucher-Sig (64-char PayWord SHA-256 preimage hex, optional if auth disabled)</label>
+            <input id="voucherSigInput" placeholder="Signed with tollgate-agent or SDK payword-proof / payWordProofForAnchor(...)" />
           </div>
         </div>
         <div class="row">

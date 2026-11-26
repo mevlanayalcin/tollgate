@@ -10,7 +10,7 @@ import (
 	"gno.land/p/nt/ufmt/v0"
 )
 
-const realmBaseLink = "/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate"
+const realmBaseLink = "/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2"
 
 func rlink(sub string) string {
 	if sub == "" {
@@ -103,7 +103,7 @@ func Render(path string) string {
 func renderHome() string {
 	var b strings.Builder
 	b.WriteString("# Tollgate — On-Chain x402 Metering & Receipt Protocol\n\n")
-	b.WriteString("> Bridging `gnolang/x402` HTTP 402 micropayments with Ed25519-authenticated prepaid credit vaults, fixed-window subscriptions, challenge-window settlements, and verifiable SHA-256 receipts on Gno.land.\n\n")
+	b.WriteString("> Bridging `gnolang/x402` HTTP 402 micropayments with PayWord SHA-256 hash-chain authenticated prepaid credit vaults, fixed-window subscriptions, challenge-window settlements, and verifiable SHA-256 receipts on Gno.land.\n\n")
 
 	b.WriteString("## Quick Actions\n\n")
 	b.WriteString("- [**Register a Service**](" + actionLink("RegisterService", "") + ") · ")
@@ -242,7 +242,7 @@ func renderPasses() string {
 		}
 		auth := "challenge-only"
 		if p.voucherPubKey != "" {
-			auth = "ed25519:" + p.voucherPubKey[:10] + "..."
+			auth = "payword:" + p.voucherPubKey[:10] + "..."
 		}
 		b.WriteString(ufmt.Sprintf(
 			"| [#%d](%s) | [#%d](%s) | `%s` | `%d` | `%d` | `%d` | `%d` | `%s` | `%d` | `%s` |\n",

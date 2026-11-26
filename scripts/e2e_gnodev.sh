@@ -14,7 +14,7 @@ GW_PORT=38402
 RPC_URL="http://127.0.0.1:${RPC_PORT}"
 CHAIN_ID="dev"
 P_PATH="gno.land/p/${ADDR}/tollgate"
-R_PATH="gno.land/r/${ADDR}/tollgate"
+R_PATH="gno.land/r/${ADDR}/tollgate/v2"
 STATE_FILE="/tmp/tollgate-e2e-state.json"
 
 cleanup() {
@@ -57,7 +57,7 @@ for _ in $(seq 1 90); do
 done
 curl -sS "${RPC_URL}/status" | grep -q "latest_block_height"
 
-echo "[2/8] Deploying /p/ and /r/ tollgate packages to gnodev..."
+echo "[2/8] Deploying /p/tollgate and /r/tollgate/v2 (PayWord SHA-256) to gnodev..."
 printf "%s\n" "$PW" | "$BIN/gnokey" maketx addpkg deployer \
   -home "$KEYHOME" -insecure-password-stdin \
   -remote "$RPC_URL" -chainid "$CHAIN_ID" -broadcast \
@@ -69,13 +69,13 @@ printf "%s\n" "$PW" | "$BIN/gnokey" maketx addpkg deployer \
   -home "$KEYHOME" -insecure-password-stdin \
   -remote "$RPC_URL" -chainid "$CHAIN_ID" -broadcast \
   -gas-fee 1000000ugnot -gas-wanted 140000000 -max-deposit 120000000ugnot \
-  -pkgpath "$R_PATH" -pkgdir "$ROOT/gno/r/${ADDR}/tollgate"
+  -pkgpath "$R_PATH" -pkgdir "$ROOT/gno/r/${ADDR}/tollgate/v2"
 wait_next_block
 
-echo "[3/8] Generating Ed25519 buyer voucher keypair & calling RegisterService, OpenPass, Subscribe..."
-KP_JSON=$("$ROOT/bin/tollgate-agent" keygen)
-VOUCHER_PUB=$(echo "$KP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['publicKeyHex'])")
-VOUCHER_SEED=$(echo "$KP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['seedHex'])")
+echo "[3/8] Generating PayWord SHA-256 hash-chain & calling RegisterService, OpenPass, Subscribe..."
+KP_JSON=$("$ROOT/bin/tollgate-agent" keygen --chain-id "$CHAIN_ID" --depth 1000)
+PW_ANCHOR=$(echo "$KP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['anchorHex'])")
+PW_SEED=$(echo "$KP_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['seedHex'])")
 
 printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
   -home "$KEYHOME" -insecure-password-stdin \
@@ -87,7 +87,7 @@ printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
   -args "http://127.0.0.1:${GW_PORT}/api/v1/oracle" \
   -args "$ADDR" \
   -args "1000" -args "10000" -args "500" -args "50" -args "10" \
-  -args "Live verified market feeds over HTTP 402 + Tollgate."
+  -args "Live verified market feeds over HTTP 402 + Tollgate PayWord."
 wait_next_block
 
 printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
@@ -96,7 +96,7 @@ printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
   -gas-fee 1000000ugnot -gas-wanted 20000000 \
   -send 50000ugnot \
   -pkgpath "$R_PATH" -func OpenPass \
-  -args "1" -args "2000" -args "500" -args "$VOUCHER_PUB"
+  -args "1" -args "2000" -args "500" -args "$PW_ANCHOR"
 wait_next_block
 
 printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
@@ -105,10 +105,10 @@ printf "%s\n" "$PW" | "$BIN/gnokey" maketx call deployer \
   -gas-fee 1000000ugnot -gas-wanted 20000000 \
   -send 10000ugnot \
   -pkgpath "$R_PATH" -func Subscribe \
-  -args "1" -args "$VOUCHER_PUB"
+  -args "1" -args "$PW_ANCHOR"
 wait_next_block
 
-echo "[4/8] Starting live tollgate-gateway with Ed25519 auth, persistent state, and on-chain GnokeySubmitter..."
+echo "[4/8] Starting live tollgate-gateway with PayWord auth, persistent state, and on-chain GnokeySubmitter..."
 "$ROOT/bin/tollgate-gateway" \
   --listen "127.0.0.1:${GW_PORT}" \
   --rpc "$RPC_URL" \
@@ -144,35 +144,35 @@ if [[ "$UNAUTH_CODE" != "401" ]]; then
 fi
 echo "Unsigned request rejected cleanly with HTTP 401."
 
-echo "[6/8] Running tollgate-agent with Ed25519 voucher signing on pass & subscription rails + replay check..."
+echo "[6/8] Running tollgate-agent with PayWord SHA-256 preimages on pass & subscription rails + replay check..."
 PASS_OUT=$("$ROOT/bin/tollgate-agent" call \
   --url "http://127.0.0.1:${GW_PORT}/api/v1/oracle?pair=GNOT-USD" \
   --rpc "$RPC_URL" --realm "$R_PATH" --pass 1 --units 10 --nonce "e2e-pass-001" \
-  --voucher-key "$VOUCHER_SEED")
+  --voucher-key "$PW_SEED" --payword-depth 1000)
 echo "$PASS_OUT"
-echo "$PASS_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['probeStatus']==402 and d['finalStatus']==200 and d['selectedRail']=='metered-pass' and d['netUgnot']==9500 and d['localProofVerified']==True and len(d['voucherSigHex'])==128, d"
+echo "$PASS_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['probeStatus']==402 and d['finalStatus']==200 and d['selectedRail']=='metered-pass' and d['netUgnot']==9500 and d['localProofVerified']==True and len(d['voucherProofHex'])==64, d"
 
-REPLAY_SIG=$(echo "$PASS_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['voucherSigHex'])")
+REPLAY_PROOF=$(echo "$PASS_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['voucherProofHex'])")
 REPLAY_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
   -H "X-Tollgate-Pass: 1" -H "X-Tollgate-Units: 10" -H "X-Tollgate-Nonce: e2e-pass-001" \
-  -H "X-Tollgate-Voucher-Sig: ${REPLAY_SIG}" \
+  -H "X-Tollgate-Voucher-Sig: ${REPLAY_PROOF}" \
   "http://127.0.0.1:${GW_PORT}/api/v1/oracle?pair=GNOT-USD")
-if [[ "$REPLAY_CODE" != "409" ]]; then
-  echo "Expected HTTP 409 on nonce replay, got $REPLAY_CODE"
+if [[ "$REPLAY_CODE" != "409" && "$REPLAY_CODE" != "401" ]]; then
+  echo "Expected HTTP 409/401 on replay, got $REPLAY_CODE"
   exit 1
 fi
-echo "Nonce replay rejected cleanly with HTTP 409."
+echo "Replay rejected cleanly with HTTP ${REPLAY_CODE}."
 
 SUB_OUT=$("$ROOT/bin/tollgate-agent" call \
   --url "http://127.0.0.1:${GW_PORT}/api/v1/oracle?pair=GNOT-USD" \
   --rpc "$RPC_URL" --realm "$R_PATH" --sub 1 --units 2 --nonce "e2e-sub-001" \
-  --voucher-key "$VOUCHER_SEED")
+  --voucher-key "$PW_SEED" --payword-depth 1000)
 echo "$SUB_OUT"
-echo "$SUB_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['probeStatus']==402 and d['finalStatus']==200 and d['selectedRail']=='subscription' and d['localProofVerified']==True and len(d['voucherSigHex'])==128, d"
+echo "$SUB_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['probeStatus']==402 and d['finalStatus']==200 and d['selectedRail']=='subscription' and d['localProofVerified']==True and len(d['voucherProofHex'])==64, d"
 
 echo "[7/8] Checking MCP stdio server & triggering real gateway on-chain settlement flush (/api/settle-now)..."
 MCP_OUT=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tollgate_chain_summary","arguments":{}}}\n' \
-  | "$ROOT/bin/tollgate-agent" mcp --rpc "$RPC_URL" --realm "$R_PATH" --voucher-key "$VOUCHER_SEED")
+  | "$ROOT/bin/tollgate-agent" mcp --rpc "$RPC_URL" --realm "$R_PATH" --voucher-key "$PW_SEED")
 echo "$MCP_OUT" | grep -q "tollgate_paid_fetch"
 echo "$MCP_OUT" | python3 -c "import sys,json; lines=[json.loads(l) for l in sys.stdin if l.strip()]; d=json.loads(lines[1]['result']['content'][0]['text']); assert d['services']==1 and d['vaultBalanceUgnot']==50000, d"
 
@@ -181,7 +181,7 @@ echo "$SETTLE_OUT"
 echo "$SETTLE_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['settled']==2 and all(r['settled'] for r in d['receipts']), d"
 wait_next_block
 
-echo "[8/8] Verifying BOTH gateway-settled Ed25519 receipts on-chain & checking gnoweb rendering..."
+echo "[8/8] Verifying BOTH gateway-settled PayWord receipts on-chain & checking gnoweb rendering..."
 EXPECTED_PASS_COMMIT=$(echo "$PASS_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['receiptCommitment'])")
 EXPECTED_SUB_COMMIT=$(echo "$SUB_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['receiptCommitment'])")
 
@@ -193,11 +193,11 @@ VERIFY_SUB=$("$ROOT/bin/tollgate-agent" verify --rpc "$RPC_URL" --realm "$R_PATH
 echo "$VERIFY_SUB"
 echo "$VERIFY_SUB" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['verified']==True and d['onChainReceipt']['buyerSigned']==True and d['onChainReceipt']['commitment']=='${EXPECTED_SUB_COMMIT}', d"
 
-GNOWEB_HTML=$(curl -sS "http://127.0.0.1:${WEB_PORT}/r/${ADDR}/tollgate")
+GNOWEB_HTML=$(curl -sS "http://127.0.0.1:${WEB_PORT}/r/${ADDR}/tollgate/v2")
 echo "$GNOWEB_HTML" | grep -q "Alpha Price Oracle"
 if echo "$GNOWEB_HTML" | grep -q "GnoLinkTypeInvalid\|data-invalid"; then
   echo "Detected invalid gnoweb link!"
   exit 1
 fi
 
-echo "=== TOLLGATE E2E GNODEV 100% GREEN (ED25519 AUTH + AUTO-SETTLE + GNOWEB VERIFIED) ==="
+echo "=== TOLLGATE E2E GNODEV 100% GREEN (PAYWORD SHA-256 + AUTO-SETTLE + GNOWEB VERIFIED) ==="

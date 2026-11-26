@@ -7,10 +7,10 @@ ADDR    ?= g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2
 all: gno-test gno-lint build go-test ts-test
 
 gno-test:
-	GNOROOT=$(GNOROOT) $(GNO_BIN) test -root-dir $(GNOROOT) -v ./gno/p/$(ADDR)/tollgate ./gno/r/$(ADDR)/tollgate
+	GNOROOT=$(GNOROOT) $(GNO_BIN) test -root-dir $(GNOROOT) -v ./gno/p/$(ADDR)/tollgate ./gno/r/$(ADDR)/tollgate/v2
 
 gno-lint:
-	GNOROOT=$(GNOROOT) $(GNO_BIN) lint -root-dir $(GNOROOT) -v ./gno/p/$(ADDR)/tollgate ./gno/r/$(ADDR)/tollgate
+	GNOROOT=$(GNOROOT) $(GNO_BIN) lint -root-dir $(GNOROOT) -v ./gno/p/$(ADDR)/tollgate ./gno/r/$(ADDR)/tollgate/v2
 
 build:
 	mkdir -p bin

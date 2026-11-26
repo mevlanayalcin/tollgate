@@ -68,8 +68,10 @@ type MiddlewareConfig struct {
 }
 
 type persistedState struct {
-	UsedNonces map[string]bool  `json:"usedNonces"`
-	Receipts   []PendingReceipt `json:"receipts"`
+	UsedNonces      map[string]bool   `json:"usedNonces"`
+	Receipts        []PendingReceipt  `json:"receipts"`
+	LocalPassAnchor map[uint64]string `json:"localPassAnchor,omitempty"`
+	LocalSubAnchor  map[uint64]string `json:"localSubAnchor,omitempty"`
 }
 
 type Middleware struct {
@@ -77,17 +79,21 @@ type Middleware struct {
 	mu            sync.Mutex
 	flushMu       sync.Mutex
 	usedNonces    map[string]bool
-	localDebits   map[uint64]int64
-	localSubUsage map[uint64]int64
-	receipts      []PendingReceipt
+	localDebits     map[uint64]int64
+	localSubUsage   map[uint64]int64
+	localPassAnchor map[uint64]string
+	localSubAnchor  map[uint64]string
+	receipts        []PendingReceipt
 }
 
 func NewMiddleware(cfg MiddlewareConfig) *Middleware {
 	m := &Middleware{
 		cfg:           cfg,
 		usedNonces:    make(map[string]bool),
-		localDebits:   make(map[uint64]int64),
-		localSubUsage: make(map[uint64]int64),
+		localDebits:     make(map[uint64]int64),
+		localSubUsage:   make(map[uint64]int64),
+		localPassAnchor: make(map[uint64]string),
+		localSubAnchor:  make(map[uint64]string),
 	}
 	m.loadState()
 	return m
@@ -110,6 +116,12 @@ func (m *Middleware) loadState() {
 			m.usedNonces[k] = true
 		}
 	}
+	for k, v := range st.LocalPassAnchor {
+		m.localPassAnchor[k] = v
+	}
+	for k, v := range st.LocalSubAnchor {
+		m.localSubAnchor[k] = v
+	}
 	m.receipts = st.Receipts
 	for _, r := range m.receipts {
 		if !r.Settled && !r.DeadLetter {
@@ -127,8 +139,10 @@ func (m *Middleware) saveStateLocked() {
 		return
 	}
 	raw, err := json.MarshalIndent(persistedState{
-		UsedNonces: m.usedNonces,
-		Receipts:   m.receipts,
+		UsedNonces:      m.usedNonces,
+		Receipts:        m.receipts,
+		LocalPassAnchor: m.localPassAnchor,
+		LocalSubAnchor:  m.localSubAnchor,
 	}, "", "  ")
 	if err != nil {
 		return
@@ -160,7 +174,7 @@ func isPermanentSettlementError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	for _, pat := range []string{
 		"already used", "expired", "is closed", "invalid buyer",
-		"not found", "invalid ed25519", "out of bounds", "exceeds",
+		"not found", "invalid payword", "out of bounds", "exceeds",
 	} {
 		if strings.Contains(msg, pat) {
 			return true
@@ -350,21 +364,14 @@ func (m *Middleware) handleSubscription(
 	}
 
 	buyerSig := r.Header.Get(HeaderTollgateVoucherSig)
-	if sub.VoucherPubKey != "" {
-		if !VerifyVoucher(sub.VoucherPubKey, buyerSig, m.cfg.ChainID, spec.ServiceID, 0, subID, units, nonce, resHash) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":"invalid or missing X-Tollgate-Voucher-Sig for subscription"}`))
-			return
-		}
-	} else if m.cfg.RequireAuth {
+	if sub.VoucherPubKey == "" && m.cfg.RequireAuth {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":"subscription has no registered Ed25519 voucherPubKey"}`))
+		_, _ = w.Write([]byte(`{"error":"subscription has no registered PayWord voucher root"}`))
 		return
 	}
 
-	// Atomic quota + nonce reservation
+	// Atomic quota + nonce + PayWord anchor reservation
 	nKey := strconv.FormatUint(spec.ServiceID, 10) + ":" + nonce
 	m.mu.Lock()
 	if m.usedNonces[nKey] {
@@ -372,7 +379,32 @@ func (m *Middleware) handleSubscription(
 		http.Error(w, `{"error":"duplicate nonce"}`, http.StatusConflict)
 		return
 	}
-	if m.localSubUsage[subID]+units > sub.QuotaRemaining {
+	var prevSubAnchor string
+	var advancedSubAnchor bool
+	if sub.VoucherPubKey != "" {
+		curAnchor := m.localSubAnchor[subID]
+		if curAnchor == "" {
+			curAnchor = sub.VoucherPubKey
+		}
+		if !VerifyPayWord(m.cfg.ChainID, curAnchor, buyerSig, units) {
+			m.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid or missing PayWord X-Tollgate-Voucher-Sig for subscription"}`))
+			return
+		}
+		prevSubAnchor = m.localSubAnchor[subID]
+		m.localSubAnchor[subID] = buyerSig
+		advancedSubAnchor = true
+	}
+	if units > sub.QuotaRemaining-m.localSubUsage[subID] {
+		if advancedSubAnchor {
+			if prevSubAnchor == "" {
+				delete(m.localSubAnchor, subID)
+			} else {
+				m.localSubAnchor[subID] = prevSubAnchor
+			}
+		}
 		m.mu.Unlock()
 		m.write402(w, r, spec, units, nonce, "subscription quota exhausted")
 		return
@@ -384,9 +416,15 @@ func (m *Middleware) handleSubscription(
 	buf := newBufferedResponse()
 	next.ServeHTTP(buf, r)
 	if buf.code >= 400 {
-		// Roll back reserved quota on failed resource response
 		m.mu.Lock()
 		m.localSubUsage[subID] -= units
+		if advancedSubAnchor && m.localSubAnchor[subID] == buyerSig {
+			if prevSubAnchor == "" {
+				delete(m.localSubAnchor, subID)
+			} else {
+				m.localSubAnchor[subID] = prevSubAnchor
+			}
+		}
 		m.mu.Unlock()
 		buf.flushTo(w)
 		return
@@ -447,17 +485,10 @@ func (m *Middleware) handlePass(
 	}
 
 	buyerSig := r.Header.Get(HeaderTollgateVoucherSig)
-	if pass.VoucherPubKey != "" {
-		if !VerifyVoucher(pass.VoucherPubKey, buyerSig, m.cfg.ChainID, spec.ServiceID, passID, 0, units, nonce, resHash) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":"invalid or missing X-Tollgate-Voucher-Sig for pass"}`))
-			return
-		}
-	} else if m.cfg.RequireAuth {
+	if pass.VoucherPubKey == "" && m.cfg.RequireAuth {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":"pass has no registered Ed25519 voucherPubKey"}`))
+		_, _ = w.Write([]byte(`{"error":"pass has no registered PayWord voucher root"}`))
 		return
 	}
 
@@ -471,7 +502,7 @@ func (m *Middleware) handlePass(
 		return
 	}
 
-	// Atomic balance + nonce reservation (race-free)
+	// Atomic balance + nonce + PayWord anchor reservation (race-free)
 	nKey := strconv.FormatUint(spec.ServiceID, 10) + ":" + nonce
 	m.mu.Lock()
 	if m.usedNonces[nKey] {
@@ -479,7 +510,32 @@ func (m *Middleware) handlePass(
 		http.Error(w, `{"error":"duplicate nonce"}`, http.StatusConflict)
 		return
 	}
+	var prevPassAnchor string
+	var advancedPassAnchor bool
+	if pass.VoucherPubKey != "" {
+		curAnchor := m.localPassAnchor[passID]
+		if curAnchor == "" {
+			curAnchor = pass.VoucherPubKey
+		}
+		if !VerifyPayWord(m.cfg.ChainID, curAnchor, buyerSig, units) {
+			m.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid or missing PayWord X-Tollgate-Voucher-Sig for pass"}`))
+			return
+		}
+		prevPassAnchor = m.localPassAnchor[passID]
+		m.localPassAnchor[passID] = buyerSig
+		advancedPassAnchor = true
+	}
 	if pass.AvailableUgnot-m.localDebits[passID] < charge.NetUgnot {
+		if advancedPassAnchor {
+			if prevPassAnchor == "" {
+				delete(m.localPassAnchor, passID)
+			} else {
+				m.localPassAnchor[passID] = prevPassAnchor
+			}
+		}
 		m.mu.Unlock()
 		m.write402(w, r, spec, units, nonce, "insufficient available pass balance")
 		return
@@ -491,9 +547,15 @@ func (m *Middleware) handlePass(
 	buf := newBufferedResponse()
 	next.ServeHTTP(buf, r)
 	if buf.code >= 400 {
-		// Roll back reserved debit on failed resource response
 		m.mu.Lock()
 		m.localDebits[passID] -= charge.NetUgnot
+		if advancedPassAnchor && m.localPassAnchor[passID] == buyerSig {
+			if prevPassAnchor == "" {
+				delete(m.localPassAnchor, passID)
+			} else {
+				m.localPassAnchor[passID] = prevPassAnchor
+			}
+		}
 		m.mu.Unlock()
 		buf.flushTo(w)
 		return

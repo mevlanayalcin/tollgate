@@ -38,7 +38,7 @@ func resetState() {
 func TestEndToEndMeteredPassAndSettlement(cur realm, t *testing.T) {
 	defer resetState()
 
-	pkgAddr := chain.PackageAddress("gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate")
+	pkgAddr := chain.PackageAddress("gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2")
 	provider := testutils.TestAddress("provider")
 	payTo := testutils.TestAddress("payto")
 	buyer := testutils.TestAddress("buyer")
@@ -96,7 +96,7 @@ func TestEndToEndMeteredPassAndSettlement(cur realm, t *testing.T) {
 func TestDisputeReclaimTimeoutAndReceiptInvalidation(cur realm, t *testing.T) {
 	defer resetState()
 
-	pkgAddr := chain.PackageAddress("gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate")
+	pkgAddr := chain.PackageAddress("gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2")
 	provider := testutils.TestAddress("prov2")
 	buyer := testutils.TestAddress("buyer2")
 	testing.IssueCoins(pkgAddr, chain.NewCoins(chain.NewCoin("ugnot", 500_000)))
@@ -141,10 +141,10 @@ func TestDisputeReclaimTimeoutAndReceiptInvalidation(cur realm, t *testing.T) {
 	uassert.Equal(t, int64(10000), ClosePass(cross(cur), pid))
 }
 
-func TestEd25519VoucherOverflowBoundsAndGnowebLinks(cur realm, t *testing.T) {
+func TestPayWordVoucherOverflowBoundsAndGnowebLinks(cur realm, t *testing.T) {
 	defer resetState()
 
-	pkgAddr := chain.PackageAddress("gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate")
+	pkgAddr := chain.PackageAddress("gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2")
 	provider := testutils.TestAddress("prov3")
 	payTo := testutils.TestAddress("payto3")
 	buyer := testutils.TestAddress("buyer3")
@@ -160,19 +160,23 @@ func TestEd25519VoucherOverflowBoundsAndGnowebLinks(cur realm, t *testing.T) {
 		RecordX402Receipt(cross(cur), sid, buyer, 1, maxInt64, "vandal-1", resHash, "0xabcdef1234567890")
 	})
 
-	// Ed25519 voucher pass & subscription: forged signature rejected, REAL buyer signature accepted on-chain!
-	const testPubHex = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664"
-	const validPassSig = "48cd3256dd26d8806bf487b48bfde5cf9d5e220dc72578a71f64fcbd7faa6842156aa0846aaa26a636f71536f64e6086b76f4b2f12d0fd589c8e21bb049ace02"
-	const validSubSig = "5ea5380af1986d921cb8d0fb65b0021d4fa3b94fb1570e2f57e5e990e0730ac262972aa9627a3c880cfe94bdc8e22334f41999c3daaa0ab74da8e5c6c81cdf0c"
+	// PayWord SHA-256 hash-chain vouchers: forged rejected, overcharge rejected, valid preimage accepted & advances chain!
+	const pwAnchor = "39b11514e249701c2e36fcb5a06ec093e955429c5d06c8157576431f24bb7fc7"
+	const pwProof2 = "2d34664462464dd9a18e1f841d929186111b73464f48290ab892f6774c627eb0"
+	const pwProof3 = "7ad016fd3a6bdefb48285eca43c4efad2345afd70d83b3fa5563a18d6e7ec3cf"
+	const pwBad = "0000000000000000000000000000000000000000000000000000000000000000"
 	testing.SetRealm(testing.NewUserRealm(buyer))
 	testing.SetOriginSend(chain.NewCoins(chain.NewCoin("ugnot", 5000)))
-	pid := OpenPass(cross(cur), sid, 500, 100, testPubHex)
+	pid := OpenPass(cross(cur), sid, 500, 100, pwAnchor)
 
 	testing.SetRealm(testing.NewUserRealm(provider))
-	uassert.AbortsWithMessage(t, cur, "tollgate: invalid Ed25519 buyer voucher signature", func() {
-		ClaimSettlement(cross(cur), pid, 2, "forged-1", resHash, strings.Repeat("00", 64))
+	uassert.AbortsWithMessage(t, cur, "tollgate: invalid PayWord SHA-256 buyer voucher preimage", func() {
+		ClaimSettlement(cross(cur), pid, 2, "forged-1", resHash, pwBad)
 	})
-	stID := ClaimSettlement(cross(cur), pid, 2, "valid-pass-1", resHash, validPassSig)
+	uassert.AbortsWithMessage(t, cur, "tollgate: invalid PayWord SHA-256 buyer voucher preimage", func() {
+		ClaimSettlement(cross(cur), pid, 3, "overcharge-1", resHash, pwProof2)
+	})
+	stID := ClaimSettlement(cross(cur), pid, 2, "valid-pass-1", resHash, pwProof2)
 	st, ok := GetSettlement(stID)
 	urequire.True(t, ok)
 	uassert.Equal(t, StatusPending, st.Status)
@@ -180,30 +184,30 @@ func TestEd25519VoucherOverflowBoundsAndGnowebLinks(cur realm, t *testing.T) {
 	urequire.True(t, ok)
 	uassert.True(t, passRec.BuyerSigned)
 
-	// Ed25519 voucher subscription: forged rejected, valid accepted, quota wraparound rejected
+	// PayWord voucher subscription: forged rejected, valid 3-unit preimage accepted
 	testing.SetRealm(testing.NewUserRealm(buyer))
 	testing.SetOriginSend(chain.NewCoins(chain.NewCoin("ugnot", 5000)))
-	subID := Subscribe(cross(cur), sid, testPubHex)
+	subID := Subscribe(cross(cur), sid, pwAnchor)
 	uassert.False(t, CheckSubscriptionActive(subID, maxInt64))
 
 	testing.SetRealm(testing.NewUserRealm(provider))
-	uassert.AbortsWithMessage(t, cur, "tollgate: invalid Ed25519 buyer voucher signature", func() {
-		ConsumeSubscription(cross(cur), subID, 3, "forged-sub-1", resHash, strings.Repeat("00", 64))
+	uassert.AbortsWithMessage(t, cur, "tollgate: invalid PayWord SHA-256 buyer voucher preimage", func() {
+		ConsumeSubscription(cross(cur), subID, 3, "forged-sub-1", resHash, pwBad)
 	})
-	subRecID := ConsumeSubscription(cross(cur), subID, 3, "valid-sub-1", resHash, validSubSig)
+	subRecID := ConsumeSubscription(cross(cur), subID, 3, "valid-sub-1", resHash, pwProof3)
 	subRec, ok := GetReceipt(subRecID)
 	urequire.True(t, ok)
 	uassert.True(t, subRec.BuyerSigned)
 
 	// Not-found pages include clean back links without leading-colon syntax
-	uassert.True(t, strings.Contains(Render("pass/999"), "[Back to Home](/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate)"))
-	uassert.True(t, strings.Contains(Render("sub/999"), "[Back to Home](/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate)"))
-	uassert.True(t, strings.Contains(Render("receipt/999"), "[Back to Home](/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate)"))
+	uassert.True(t, strings.Contains(Render("pass/999"), "[Back to Home](/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2)"))
+	uassert.True(t, strings.Contains(Render("sub/999"), "[Back to Home](/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2)"))
+	uassert.True(t, strings.Contains(Render("receipt/999"), "[Back to Home](/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2)"))
 
 	// P0 #1: All gnoweb links use full /r/... path (zero broken leading `](:` links!)
 	home := Render("")
 	uassert.False(t, strings.Contains(home, "](:"))
-	uassert.True(t, strings.Contains(home, "](/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate:service/1)"))
+	uassert.True(t, strings.Contains(home, "](/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate/v2:service/1)"))
 	uassert.True(t, strings.Contains(home, "$help&func=OpenPass"))
 
 	// JSON route escapes Markdown link injection cleanly
