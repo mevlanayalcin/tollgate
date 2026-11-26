@@ -1,11 +1,15 @@
 // Command tollgate-agent is an autonomous AI payment client and MCP tool bridge
 // that negotiates HTTP 402 (x402 v2) + Tollgate prepaid passes & subscriptions,
-// verifies SHA-256 receipt commitments locally and on-chain, and prints audit proofs.
+// signs Ed25519 buyer vouchers, verifies SHA-256 receipt commitments locally and
+// on-chain, and prints audit proofs.
 package main
 
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,6 +30,10 @@ func main() {
 		os.Exit(1)
 	}
 	switch os.Args[1] {
+	case "keygen":
+		runKeygen()
+	case "sign-voucher":
+		runSignVoucher(os.Args[2:])
 	case "call":
 		runCall(os.Args[2:])
 	case "verify":
@@ -39,7 +47,61 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "Usage: tollgate-agent <call|verify|mcp> [flags]")
+	fmt.Fprintln(os.Stderr, "Usage: tollgate-agent <keygen|sign-voucher|call|verify|mcp> [flags]")
+}
+
+func runKeygen() {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "keygen failed: %v\n", err)
+		os.Exit(1)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(map[string]string{
+		"publicKeyHex":  hex.EncodeToString(pub),
+		"privateKeyHex": hex.EncodeToString(priv),
+		"seedHex":       hex.EncodeToString(priv.Seed()),
+	})
+}
+
+func parseEd25519PrivateKey(hexKey string) (ed25519.PrivateKey, error) {
+	raw, err := hex.DecodeString(strings.TrimSpace(hexKey))
+	if err != nil {
+		return nil, fmt.Errorf("decode voucher key hex: %w", err)
+	}
+	switch len(raw) {
+	case ed25519.SeedSize:
+		return ed25519.NewKeyFromSeed(raw), nil
+	case ed25519.PrivateKeySize:
+		return ed25519.PrivateKey(raw), nil
+	default:
+		return nil, fmt.Errorf("invalid Ed25519 key length %d bytes (expected 32-byte seed or 64-byte private key)", len(raw))
+	}
+}
+
+func runSignVoucher(args []string) {
+	fs := flag.NewFlagSet("sign-voucher", flag.ExitOnError)
+	voucherKey := fs.String("voucher-key", "", "Buyer Ed25519 private key or 32-byte seed hex")
+	chainID := fs.String("chain-id", "onyx-1", "Gno chain ID")
+	serviceID := fs.Uint64("service", 1, "Service ID")
+	passID := fs.Uint64("pass", 0, "Pass ID")
+	subID := fs.Uint64("sub", 0, "Subscription ID")
+	units := fs.Int64("units", 1, "Metered units")
+	nonce := fs.String("nonce", "", "Unique request nonce")
+	resHash := fs.String("res-hash", "", "64-char SHA-256 resource hash")
+	_ = fs.Parse(args)
+
+	if *voucherKey == "" || *nonce == "" || *resHash == "" {
+		fmt.Fprintln(os.Stderr, "--voucher-key, --nonce, and --res-hash are required")
+		os.Exit(1)
+	}
+	priv, err := parseEd25519PrivateKey(*voucherKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(tollgate.SignVoucher(priv, *chainID, *serviceID, *passID, *subID, *units, *nonce, *resHash))
 }
 
 func runCall(args []string) {
@@ -51,6 +113,7 @@ func runCall(args []string) {
 	subID := fs.Uint64("sub", 0, "Tollgate subscription ID")
 	units := fs.Int64("units", 1, "Metered units to request")
 	nonce := fs.String("nonce", fmt.Sprintf("agent-%d", time.Now().UnixNano()), "Unique request nonce")
+	voucherKey := fs.String("voucher-key", "", "Buyer Ed25519 private key or 32-byte seed hex (signs X-Tollgate-Voucher-Sig)")
 	_ = fs.Parse(args)
 
 	if *targetURL == "" {
@@ -58,7 +121,7 @@ func runCall(args []string) {
 		os.Exit(1)
 	}
 
-	out, err := executeAgentCall(context.Background(), *targetURL, *rpcURL, *realmPath, *passID, *subID, *units, *nonce)
+	out, err := executeAgentCall(context.Background(), *targetURL, *rpcURL, *realmPath, *passID, *subID, *units, *nonce, *voucherKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -69,17 +132,18 @@ func runCall(args []string) {
 }
 
 type AgentCallReport struct {
-	URL                string                   `json:"url"`
-	ProbeStatus        int                      `json:"probeStatus"`
+	URL                string                    `json:"url"`
+	ProbeStatus        int                       `json:"probeStatus"`
 	DiscoveredTerms    *tollgate.PaymentRequired `json:"discoveredTerms,omitempty"`
-	SelectedRail       string                   `json:"selectedRail"`
-	FinalStatus        int                      `json:"finalStatus"`
-	NetUgnot           int64                    `json:"netUgnot"`
-	Nonce              string                   `json:"nonce"`
-	ResourceHash       string                   `json:"resourceHash"`
-	ReceiptCommitment  string                   `json:"receiptCommitment"`
-	LocalProofVerified bool                     `json:"localProofVerified"`
-	ResponseBody       json.RawMessage          `json:"responseBody,omitempty"`
+	SelectedRail       string                    `json:"selectedRail"`
+	FinalStatus        int                       `json:"finalStatus"`
+	NetUgnot           int64                     `json:"netUgnot"`
+	Nonce              string                    `json:"nonce"`
+	ResourceHash       string                    `json:"resourceHash"`
+	VoucherSigHex      string                    `json:"voucherSigHex,omitempty"`
+	ReceiptCommitment  string                    `json:"receiptCommitment"`
+	LocalProofVerified bool                      `json:"localProofVerified"`
+	ResponseBody       json.RawMessage           `json:"responseBody,omitempty"`
 }
 
 func executeAgentCall(
@@ -87,7 +151,7 @@ func executeAgentCall(
 	targetURL, rpcURL, realmPath string,
 	passID, subID uint64,
 	units int64,
-	nonce string,
+	nonce, voucherKeyHex string,
 ) (AgentCallReport, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	report := AgentCallReport{URL: targetURL, Nonce: nonce}
@@ -127,7 +191,7 @@ func executeAgentCall(
 	req.Header.Set(tollgate.HeaderTollgateNonce, nonce)
 
 	var buyerAddr string
-	var usedPassID uint64
+	var usedPassID, usedSubID uint64
 	chainID := "onyx-1"
 	payTo := ""
 	if len(pr.Accepts) > 0 {
@@ -145,6 +209,7 @@ func executeAgentCall(
 			report.SelectedRail = "subscription"
 			req.Header.Set(tollgate.HeaderTollgateSub, strconv.FormatUint(subID, 10))
 			buyerAddr = sub.Buyer
+			usedSubID = subID
 		}
 	}
 	if report.SelectedRail == "" && passID > 0 {
@@ -159,6 +224,19 @@ func executeAgentCall(
 	}
 	if report.SelectedRail == "" {
 		return report, fmt.Errorf("endpoint requires payment (402): supply --pass <id> or --sub <id>")
+	}
+
+	parsedURL, _ := url.Parse(targetURL)
+	expectedResHash := tollgate.HashResource("GET " + parsedURL.RequestURI())
+
+	if strings.TrimSpace(voucherKeyHex) != "" {
+		priv, err := parseEd25519PrivateKey(voucherKeyHex)
+		if err != nil {
+			return report, err
+		}
+		sigHex := tollgate.SignVoucher(priv, chainID, svcID, usedPassID, usedSubID, units, nonce, expectedResHash)
+		req.Header.Set(tollgate.HeaderTollgateVoucherSig, sigHex)
+		report.VoucherSigHex = sigHex
 	}
 
 	// Step 3: Execute paid request & verify deterministic receipt commitment
@@ -176,9 +254,8 @@ func executeAgentCall(
 	report.ReceiptCommitment = resp.Header.Get(tollgate.HeaderTollgateCommitment)
 	report.NetUgnot, _ = strconv.ParseInt(resp.Header.Get(tollgate.HeaderTollgateNetUgnot), 10, 64)
 
-	parsedURL, _ := url.Parse(targetURL)
-	expectedResHash := tollgate.HashResource("GET " + parsedURL.RequestURI())
-	report.LocalProofVerified = report.ResourceHash == expectedResHash &&
+	report.LocalProofVerified = resp.StatusCode == http.StatusOK &&
+		report.ResourceHash == expectedResHash &&
 		tollgate.VerifyReceiptCommitment(
 			report.ReceiptCommitment,
 			chainID, svcID, usedPassID, buyerAddr, payTo,
@@ -213,7 +290,7 @@ func runVerify(args []string) {
 	_ = enc.Encode(map[string]any{
 		"onChainReceipt": rec,
 		"recomputed":     recomputed,
-		"verified":       recomputed == rec.Commitment,
+		"verified":       recomputed == rec.Commitment && rec.SettlementStatus != "refunded",
 	})
 }
 
@@ -223,6 +300,7 @@ func runMCP(args []string) {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	rpcURL := fs.String("rpc", "https://rpc.onyx.testnets.gno.land:443", "Gno RPC URL")
 	realmPath := fs.String("realm", "", "Tollgate realm path")
+	defaultVoucherKey := fs.String("voucher-key", "", "Default Ed25519 buyer voucher key hex")
 	_ = fs.Parse(args)
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -249,14 +327,15 @@ func runMCP(args []string) {
 				"tools": []map[string]any{
 					{
 						"name":        "tollgate_paid_fetch",
-						"description": "Fetch an HTTP 402 (x402 + Tollgate) API endpoint using an on-chain pass or subscription and verify the cryptographic receipt.",
+						"description": "Fetch an HTTP 402 (x402 + Tollgate) API endpoint using an Ed25519-authenticated on-chain pass or subscription and verify the cryptographic receipt.",
 						"inputSchema": map[string]any{
 							"type": "object",
 							"properties": map[string]any{
-								"url":    map[string]any{"type": "string"},
-								"passId": map[string]any{"type": "integer"},
-								"subId":  map[string]any{"type": "integer"},
-								"units":  map[string]any{"type": "integer"},
+								"url":        map[string]any{"type": "string"},
+								"passId":     map[string]any{"type": "integer"},
+								"subId":      map[string]any{"type": "integer"},
+								"units":      map[string]any{"type": "integer"},
+								"voucherKey": map[string]any{"type": "string"},
 							},
 							"required": []string{"url"},
 						},
@@ -286,10 +365,14 @@ func runMCP(args []string) {
 				pidF, _ := p.Arguments["passId"].(float64)
 				sidF, _ := p.Arguments["subId"].(float64)
 				unitsF, _ := p.Arguments["units"].(float64)
+				vKey, _ := p.Arguments["voucherKey"].(string)
+				if vKey == "" {
+					vKey = *defaultVoucherKey
+				}
 				if unitsF < 1 {
 					unitsF = 1
 				}
-				rep, err := executeAgentCall(context.Background(), u, *rpcURL, *realmPath, uint64(pidF), uint64(sidF), int64(unitsF), fmt.Sprintf("mcp-%d", time.Now().UnixNano()))
+				rep, err := executeAgentCall(context.Background(), u, *rpcURL, *realmPath, uint64(pidF), uint64(sidF), int64(unitsF), fmt.Sprintf("mcp-%d", time.Now().UnixNano()), vKey)
 				text, _ := json.Marshal(rep)
 				if err != nil {
 					text = []byte(err.Error())

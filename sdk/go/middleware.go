@@ -2,12 +2,14 @@ package tollgate
 
 import (
 	"bytes"
-	"encoding/base64"
+	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -36,33 +38,97 @@ type PendingReceipt struct {
 	Nonce        string    `json:"nonce"`
 	ResourceHash string    `json:"resourceHash"`
 	Commitment   string    `json:"commitment"`
+	BuyerSigHex  string    `json:"buyerSigHex,omitempty"`
 	TxHash       string    `json:"txHash,omitempty"`
+	Settled      bool      `json:"settled"`
 	CreatedAt    time.Time `json:"createdAt"`
 }
 
+// SettlementSubmitter submits verified gateway receipts on-chain (ClaimSettlement,
+// ConsumeSubscription, or RecordX402Receipt).
+type SettlementSubmitter interface {
+	SubmitReceipt(ctx context.Context, r PendingReceipt) (txHash string, err error)
+}
+
 type MiddlewareConfig struct {
-	ChainID     string
-	RealmPath   string
-	Chain       ChainReader
-	Facilitator Facilitator
-	Routes      map[string]RouteSpec
+	ChainID       string
+	RealmPath     string
+	Chain         ChainReader
+	Facilitator   Facilitator
+	Submitter     SettlementSubmitter
+	StateFile     string // optional JSON persistence for nonces & unsettled receipts
+	RequireAuth   bool   // when true, reject passes/subs lacking VoucherPubKey
+	Routes        map[string]RouteSpec
+}
+
+type persistedState struct {
+	UsedNonces map[string]bool  `json:"usedNonces"`
+	Receipts   []PendingReceipt `json:"receipts"`
 }
 
 type Middleware struct {
 	cfg           MiddlewareConfig
 	mu            sync.Mutex
-	usedNonces    map[string]struct{}
+	usedNonces    map[string]bool
 	localDebits   map[uint64]int64
 	localSubUsage map[uint64]int64
 	receipts      []PendingReceipt
 }
 
 func NewMiddleware(cfg MiddlewareConfig) *Middleware {
-	return &Middleware{
+	m := &Middleware{
 		cfg:           cfg,
-		usedNonces:    make(map[string]struct{}),
+		usedNonces:    make(map[string]bool),
 		localDebits:   make(map[uint64]int64),
 		localSubUsage: make(map[uint64]int64),
+	}
+	m.loadState()
+	return m
+}
+
+func (m *Middleware) loadState() {
+	if m.cfg.StateFile == "" {
+		return
+	}
+	raw, err := os.ReadFile(m.cfg.StateFile)
+	if err != nil {
+		return
+	}
+	var st persistedState
+	if err := json.Unmarshal(raw, &st); err != nil {
+		return
+	}
+	for k, v := range st.UsedNonces {
+		if v {
+			m.usedNonces[k] = true
+		}
+	}
+	m.receipts = st.Receipts
+	for _, r := range m.receipts {
+		if !r.Settled {
+			if r.Rail == "metered-pass" && r.PassID > 0 {
+				m.localDebits[r.PassID] += r.AmountUgnot
+			} else if r.Rail == "subscription" && r.SubID > 0 {
+				m.localSubUsage[r.SubID] += r.Units
+			}
+		}
+	}
+}
+
+func (m *Middleware) saveStateLocked() {
+	if m.cfg.StateFile == "" {
+		return
+	}
+	raw, err := json.MarshalIndent(persistedState{
+		UsedNonces: m.usedNonces,
+		Receipts:   m.receipts,
+	}, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := m.cfg.StateFile + ".tmp"
+	if os.WriteFile(tmp, raw, 0600) == nil {
+		_ = os.Rename(tmp, m.cfg.StateFile)
 	}
 }
 
@@ -72,6 +138,51 @@ func (m *Middleware) Receipts() []PendingReceipt {
 	out := make([]PendingReceipt, len(m.receipts))
 	copy(out, m.receipts)
 	return out
+}
+
+// FlushSettlements submits all unsettled receipts on-chain via cfg.Submitter and
+// reconciles localDebits / localSubUsage once confirmed on-chain.
+func (m *Middleware) FlushSettlements(ctx context.Context) (int, error) {
+	if m.cfg.Submitter == nil {
+		return 0, nil
+	}
+	m.mu.Lock()
+	var todo []int
+	for i := range m.receipts {
+		if !m.receipts[i].Settled {
+			todo = append(todo, i)
+		}
+	}
+	m.mu.Unlock()
+
+	settledCount := 0
+	for _, idx := range todo {
+		m.mu.Lock()
+		rec := m.receipts[idx]
+		m.mu.Unlock()
+
+		txHash, err := m.cfg.Submitter.SubmitReceipt(ctx, rec)
+		if err != nil {
+			return settledCount, err
+		}
+		m.mu.Lock()
+		if !m.receipts[idx].Settled {
+			m.receipts[idx].Settled = true
+			if txHash != "" {
+				m.receipts[idx].TxHash = txHash
+			}
+			if rec.Rail == "metered-pass" && m.localDebits[rec.PassID] >= rec.AmountUgnot {
+				m.localDebits[rec.PassID] -= rec.AmountUgnot
+			}
+			if rec.Rail == "subscription" && m.localSubUsage[rec.SubID] >= rec.Units {
+				m.localSubUsage[rec.SubID] -= rec.Units
+			}
+			m.saveStateLocked()
+			settledCount++
+		}
+		m.mu.Unlock()
+	}
+	return settledCount, nil
 }
 
 type bufferedResponse struct {
@@ -104,7 +215,6 @@ func randomNonce() string {
 	return "tg-" + hex.EncodeToString(buf[:])
 }
 
-// Wrap protects an http.Handler with dual-rail Tollgate + x402 v2 payment enforcement.
 func (m *Middleware) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		routeKey := r.Method + " " + r.URL.Path
@@ -132,7 +242,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		resDescriptor := r.Method + " " + r.URL.RequestURI()
 		resHash := HashResource(resDescriptor)
 
-		// Rail 1: Subscription fast-path
+		// Rail 1: Subscription fast-path (Ed25519 voucher authenticated)
 		if rawSub := r.Header.Get(HeaderTollgateSub); rawSub != "" {
 			subID, err := strconv.ParseUint(rawSub, 10, 64)
 			if err != nil || subID == 0 {
@@ -143,7 +253,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			return
 		}
 
-		// Rail 2: Prepaid Credit Pass fast-path
+		// Rail 2: Prepaid Credit Pass fast-path (Ed25519 voucher authenticated)
 		if rawPass := r.Header.Get(HeaderTollgatePass); rawPass != "" {
 			passID, err := strconv.ParseUint(rawPass, 10, 64)
 			if err != nil || passID == 0 {
@@ -154,26 +264,14 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			return
 		}
 
-		// Rail 3: Stock gnolang/x402 direct payment
+		// Rail 3: Stock gnolang/x402 direct payment (extracts accepted.extra.memo automatically!)
 		if sig := r.Header.Get(HeaderPaymentSignature); sig != "" {
 			m.handleX402(w, r, next, spec, units, nonce, resHash, sig)
 			return
 		}
 
-		// Unpaid request: emit x402 v2 PAYMENT-REQUIRED + Tollgate rail discovery headers
 		m.write402(w, r, spec, units, nonce, "Payment required")
 	})
-}
-
-func (m *Middleware) reserveNonce(serviceID uint64, nonce string) bool {
-	key := strconv.FormatUint(serviceID, 10) + ":" + nonce
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, exists := m.usedNonces[key]; exists {
-		return false
-	}
-	m.usedNonces[key] = struct{}{}
-	return true
 }
 
 func (m *Middleware) handleSubscription(
@@ -196,23 +294,45 @@ func (m *Middleware) handleSubscription(
 		return
 	}
 
+	buyerSig := r.Header.Get(HeaderTollgateVoucherSig)
+	if sub.VoucherPubKey != "" {
+		if !VerifyVoucher(sub.VoucherPubKey, buyerSig, m.cfg.ChainID, spec.ServiceID, 0, subID, units, nonce, resHash) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid or missing X-Tollgate-Voucher-Sig for subscription"}`))
+			return
+		}
+	} else if m.cfg.RequireAuth {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"subscription has no registered Ed25519 voucherPubKey"}`))
+		return
+	}
+
+	// Atomic quota + nonce reservation
+	nKey := strconv.FormatUint(spec.ServiceID, 10) + ":" + nonce
 	m.mu.Lock()
-	localUsed := m.localSubUsage[subID]
-	if localUsed+units > sub.QuotaRemaining {
+	if m.usedNonces[nKey] {
+		m.mu.Unlock()
+		http.Error(w, `{"error":"duplicate nonce"}`, http.StatusConflict)
+		return
+	}
+	if m.localSubUsage[subID]+units > sub.QuotaRemaining {
 		m.mu.Unlock()
 		m.write402(w, r, spec, units, nonce, "subscription quota exhausted")
 		return
 	}
+	m.usedNonces[nKey] = true
+	m.localSubUsage[subID] += units
 	m.mu.Unlock()
-
-	if !m.reserveNonce(spec.ServiceID, nonce) {
-		http.Error(w, `{"error":"duplicate nonce"}`, http.StatusConflict)
-		return
-	}
 
 	buf := newBufferedResponse()
 	next.ServeHTTP(buf, r)
 	if buf.code >= 400 {
+		// Roll back reserved quota on failed resource response
+		m.mu.Lock()
+		m.localSubUsage[subID] -= units
+		m.mu.Unlock()
 		buf.flushTo(w)
 		return
 	}
@@ -221,7 +341,6 @@ func (m *Middleware) handleSubscription(
 		m.cfg.ChainID, spec.ServiceID, 0, sub.Buyer, spec.PayTo, units, 0, nonce, resHash,
 	)
 	m.mu.Lock()
-	m.localSubUsage[subID] += units
 	m.receipts = append(m.receipts, PendingReceipt{
 		Rail:         "subscription",
 		ServiceID:    spec.ServiceID,
@@ -233,8 +352,10 @@ func (m *Middleware) handleSubscription(
 		Nonce:        nonce,
 		ResourceHash: resHash,
 		Commitment:   commitment,
+		BuyerSigHex:  buyerSig,
 		CreatedAt:    time.Now().UTC(),
 	})
+	m.saveStateLocked()
 	m.mu.Unlock()
 
 	buf.header.Set(HeaderTollgateRail, "subscription")
@@ -269,6 +390,22 @@ func (m *Middleware) handlePass(
 		m.write402(w, r, spec, units, nonce, "credit pass expired")
 		return
 	}
+
+	buyerSig := r.Header.Get(HeaderTollgateVoucherSig)
+	if pass.VoucherPubKey != "" {
+		if !VerifyVoucher(pass.VoucherPubKey, buyerSig, m.cfg.ChainID, spec.ServiceID, passID, 0, units, nonce, resHash) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid or missing X-Tollgate-Voucher-Sig for pass"}`))
+			return
+		}
+	} else if m.cfg.RequireAuth {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"pass has no registered Ed25519 voucherPubKey"}`))
+		return
+	}
+
 	charge, err := ComputeCharge(spec.UnitPriceUgnot, units)
 	if err != nil {
 		http.Error(w, `{"error":"invalid charge computation"}`, http.StatusBadRequest)
@@ -279,24 +416,30 @@ func (m *Middleware) handlePass(
 		return
 	}
 
+	// Atomic balance + nonce reservation (race-free)
+	nKey := strconv.FormatUint(spec.ServiceID, 10) + ":" + nonce
 	m.mu.Lock()
-	localDebit := m.localDebits[passID]
-	if pass.AvailableUgnot-localDebit < charge.NetUgnot {
+	if m.usedNonces[nKey] {
+		m.mu.Unlock()
+		http.Error(w, `{"error":"duplicate nonce"}`, http.StatusConflict)
+		return
+	}
+	if pass.AvailableUgnot-m.localDebits[passID] < charge.NetUgnot {
 		m.mu.Unlock()
 		m.write402(w, r, spec, units, nonce, "insufficient available pass balance")
 		return
 	}
+	m.usedNonces[nKey] = true
+	m.localDebits[passID] += charge.NetUgnot
 	m.mu.Unlock()
-
-	if !m.reserveNonce(spec.ServiceID, nonce) {
-		http.Error(w, `{"error":"duplicate nonce"}`, http.StatusConflict)
-		return
-	}
 
 	buf := newBufferedResponse()
 	next.ServeHTTP(buf, r)
-	// Identical to x402 authorization semantics: never charge for a >=400 resource error.
 	if buf.code >= 400 {
+		// Roll back reserved debit on failed resource response
+		m.mu.Lock()
+		m.localDebits[passID] -= charge.NetUgnot
+		m.mu.Unlock()
 		buf.flushTo(w)
 		return
 	}
@@ -307,7 +450,6 @@ func (m *Middleware) handlePass(
 	)
 
 	m.mu.Lock()
-	m.localDebits[passID] += charge.NetUgnot
 	m.receipts = append(m.receipts, PendingReceipt{
 		Rail:         "metered-pass",
 		ServiceID:    spec.ServiceID,
@@ -321,8 +463,10 @@ func (m *Middleware) handlePass(
 		Nonce:        nonce,
 		ResourceHash: resHash,
 		Commitment:   commitment,
+		BuyerSigHex:  buyerSig,
 		CreatedAt:    time.Now().UTC(),
 	})
+	m.saveStateLocked()
 	m.mu.Unlock()
 
 	buf.header.Set(HeaderTollgateRail, "metered-pass")
@@ -340,14 +484,38 @@ func (m *Middleware) handleX402(
 	next http.Handler,
 	spec RouteSpec,
 	units int64,
-	nonce string,
+	fallbackNonce string,
 	resHash string,
 	sigHeader string,
 ) {
 	if m.cfg.Facilitator == nil {
-		m.write402(w, r, spec, units, nonce, "x402 facilitator not configured")
+		m.write402(w, r, spec, units, fallbackNonce, "x402 facilitator not configured")
 		return
 	}
+
+	// Stock x402 interop fix: extract accepted.extra.memo from PAYMENT-SIGNATURE
+	// so stock @gnolang/x402 & Go clients do NOT hit memo_mismatch!
+	nonce := fallbackNonce
+	if extractedMemo, ok := ExtractX402AcceptedMemo(sigHeader); ok {
+		parsedSvc, parsedNonce, valid := ParseInvoiceMemo(extractedMemo)
+		if !valid || parsedSvc != spec.ServiceID {
+			m.write402(w, r, spec, units, fallbackNonce, "x402 invoice memo does not match service")
+			return
+		}
+		nonce = parsedNonce
+	}
+
+	// Reserve x402 nonce atomically to prevent replay
+	nKey := strconv.FormatUint(spec.ServiceID, 10) + ":" + nonce
+	m.mu.Lock()
+	if m.usedNonces[nKey] {
+		m.mu.Unlock()
+		http.Error(w, `{"error":"duplicate x402 invoice nonce"}`, http.StatusConflict)
+		return
+	}
+	m.usedNonces[nKey] = true
+	m.mu.Unlock()
+
 	charge, err := ComputeCharge(spec.UnitPriceUgnot, units)
 	if err != nil {
 		http.Error(w, `{"error":"invalid charge"}`, http.StatusBadRequest)
@@ -369,28 +537,37 @@ func (m *Middleware) handleX402(
 
 	verifyRes, err := m.cfg.Facilitator.Verify(r.Context(), sigHeader, reqTerms)
 	if err != nil || !verifyRes.IsValid {
+		m.mu.Lock()
+		delete(m.usedNonces, nKey)
+		m.mu.Unlock()
 		reason := verifyRes.InvalidReason
 		if err != nil {
 			reason = err.Error()
 		}
-		m.write402(w, r, spec, units, nonce, "x402 verify refused: "+reason)
+		m.write402(w, r, spec, units, fallbackNonce, "x402 verify refused: "+reason)
 		return
 	}
 
 	buf := newBufferedResponse()
 	next.ServeHTTP(buf, r)
 	if buf.code >= 400 {
+		m.mu.Lock()
+		delete(m.usedNonces, nKey)
+		m.mu.Unlock()
 		buf.flushTo(w)
 		return
 	}
 
 	settleRes, err := m.cfg.Facilitator.Settle(r.Context(), sigHeader, reqTerms)
 	if err != nil || !settleRes.Success {
+		m.mu.Lock()
+		delete(m.usedNonces, nKey)
+		m.mu.Unlock()
 		reason := settleRes.ErrorReason
 		if err != nil {
 			reason = err.Error()
 		}
-		m.write402(w, r, spec, units, nonce, "x402 settle failed: "+reason)
+		m.write402(w, r, spec, units, fallbackNonce, "x402 settle failed: "+reason)
 		return
 	}
 
@@ -419,6 +596,7 @@ func (m *Middleware) handleX402(
 		TxHash:       settleRes.Transaction,
 		CreatedAt:    time.Now().UTC(),
 	})
+	m.saveStateLocked()
 	m.mu.Unlock()
 
 	payRespRaw, _ := json.Marshal(settleRes)
@@ -493,6 +671,7 @@ func (m *Middleware) write402(
 			"serviceId":      spec.ServiceID,
 			"passHeader":     HeaderTollgatePass,
 			"subHeader":      HeaderTollgateSub,
+			"voucherHeader":  HeaderTollgateVoucherSig,
 			"x402Header":     HeaderPaymentSignature,
 			"volumeDiscount": charge,
 		},

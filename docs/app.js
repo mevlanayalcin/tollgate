@@ -1,39 +1,26 @@
 const $ = (id) => document.getElementById(id);
 
-function toHexUtf8(str) {
-  const bytes = new TextEncoder().encode(str);
-  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-async function queryRender(rpcUrl, realmPath, subPath) {
-  const cleanRpc = rpcUrl.replace(/\/+$/, "");
-  const cleanRealm = realmPath.replace(/^\/+|\/+$/g, "");
-  const dataHex = toHexUtf8(`${cleanRealm}:${subPath}`);
-  const url = `${cleanRpc}/abci_query?path=${encodeURIComponent('"vm/qrender"')}&data=0x${dataHex}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
-  const env = await res.json();
-  const base = env?.result?.response?.ResponseBase;
-  if (base?.Error) throw new Error(JSON.stringify(base.Error));
-  if (!base?.Data) return "";
-  const bin = atob(base.Data);
-  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
-}
-
-function lp(s) {
-  const byteLen = new TextEncoder().encode(s).length;
-  return `${byteLen}:${s}|`;
+function toHex(str) {
+  return Array.from(new TextEncoder().encode(str))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 async function sha256Hex(str) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
-  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function lp(s) {
+  const bytes = new TextEncoder().encode(s).length;
+  return `${bytes}:${s}|`;
 }
 
 async function computeReceiptCommitment(p) {
   const preimage =
-    `tollgate-receipt-v1|` +
+    "tollgate-receipt-v1|" +
     lp(p.chainId) +
     `${p.serviceId}|${p.passId}|` +
     lp(p.buyer) +
@@ -44,22 +31,35 @@ async function computeReceiptCommitment(p) {
   return sha256Hex(preimage);
 }
 
+async function queryRender(rpc, realm, subPath) {
+  const base = rpc.replace(/\/+$/, "");
+  const cleanRealm = realm.replace(/^\/+|\/+$/g, "");
+  const hexData = toHex(`${cleanRealm}:${subPath}`);
+  const url = `${base}/abci_query?path=${encodeURIComponent("\"vm/qrender\"")}&data=0x${hexData}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
+  const body = await res.json();
+  const rb = body?.result?.response?.ResponseBase;
+  if (rb?.Error) throw new Error(`ABCI error: ${JSON.stringify(rb.Error)}`);
+  if (!rb?.Data) return "";
+  return atob(rb.Data);
+}
+
 async function syncChain() {
   const rpc = $("rpcInput").value.trim();
   const realm = $("realmInput").value.trim();
   $("statusBadge").textContent = "RPC: syncing…";
   try {
-    const [sumRaw, svcRaw] = await Promise.all([
+    const [sumRaw, svcsRaw] = await Promise.all([
       queryRender(rpc, realm, "json/summary"),
       queryRender(rpc, realm, "json/services"),
     ]);
     const sum = JSON.parse(sumRaw);
-    const svcs = JSON.parse(svcRaw);
-
+    const svcs = JSON.parse(svcsRaw);
     $("chainBadge").textContent = `chain: ${sum.chainId}`;
-    $("statusBadge").textContent = `RPC: live @ #${sum.height}`;
+    $("statusBadge").textContent = `RPC: synced #${sum.height}`;
     $("statTvl").textContent = `${sum.vaultBalanceUgnot} ugnot`;
-    $("statHeight").textContent = `#${sum.height}`;
+    $("statHeight").textContent = `${sum.height}`;
     $("statServices").textContent = `${sum.services}`;
     $("statPasses").textContent = `${sum.passes}`;
     $("statSubs").textContent = `${sum.subscriptions}`;
@@ -67,7 +67,7 @@ async function syncChain() {
 
     const tbody = $("servicesBody");
     if (!svcs.length) {
-      tbody.innerHTML = `<tr><td colspan="8" class="muted">No services registered on this realm yet.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="9" class="muted">No services registered on this realm yet.</td></tr>`;
     } else {
       tbody.innerHTML = svcs.map((s) => `
         <tr>
@@ -78,17 +78,18 @@ async function syncChain() {
           <td>${s.subPriceUgnot > 0 ? `${s.subPriceUgnot} ugnot / ${s.subQuota}` : "—"}</td>
           <td>${s.challengeBlocks} blk</td>
           <td>${s.totalCalls}</td>
-          <td>${s.totalRevenue} ugnot</td>
+          <td>${s.escrowedRevenue ?? 0} ugnot</td>
+          <td>${s.x402AttestedRevenue ?? 0} ugnot</td>
         </tr>`).join("");
     }
   } catch (err) {
     $("statusBadge").textContent = "RPC: offline / not deployed yet";
-    $("servicesBody").innerHTML = `<tr><td colspan="8" class="muted">${escapeHtml(err.message)}</td></tr>`;
+    $("servicesBody").innerHTML = `<tr><td colspan="9" class="muted">${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
+  return String(s).replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[m]));
 }
 
 function gatewayBase() {
@@ -102,11 +103,21 @@ async function runRequest(useCredentials) {
   if (useCredentials) {
     const passId = $("passIdInput").value.trim();
     const subId = $("subIdInput").value.trim();
+    const voucherSig = $("voucherSigInput").value.trim();
     if (subId) headers["X-Tollgate-Sub"] = subId;
     else if (passId) headers["X-Tollgate-Pass"] = passId;
+    if (voucherSig) headers["X-Tollgate-Voucher-Sig"] = voucherSig;
     headers["X-Tollgate-Nonce"] = `web-${Date.now()}`;
   }
-  const url = `${gatewayBase()}${path}`;
+  const base = gatewayBase();
+  if (!base && location.hostname.endsWith("github.io")) {
+    $("httpStatusPill").textContent = "NO GATEWAY";
+    $("httpStatusPill").className = "pill perr";
+    $("playgroundOutput").textContent =
+      "Enter a running Tollgate gateway URL above (for example http://127.0.0.1:8402) to run live HTTP 402 probes.\nStart locally with: ./bin/tollgate-gateway --realm <realm> --pay-to <addr>";
+    return;
+  }
+  const url = `${base}${path}`;
   const pill = $("httpStatusPill");
   try {
     const res = await fetch(url, { headers });
@@ -165,8 +176,11 @@ async function verifyOnChainReceipt() {
       nonce: rec.nonce,
       resourceHash: rec.resourceHash,
     });
+    const refunded = rec.settlementStatus === "refunded";
     $("verifierOutput").textContent = JSON.stringify({
-      verifiedByWebCrypto: recomputed === rec.commitment,
+      verifiedByWebCrypto: recomputed === rec.commitment && !refunded,
+      settlementStatus: rec.settlementStatus || "none",
+      buyerSigned: Boolean(rec.buyerSigned),
       recomputedSha256: recomputed,
       onChainReceipt: rec,
     }, null, 2);
@@ -180,10 +194,17 @@ $("probe402Btn").addEventListener("click", () => runRequest(false));
 $("callPaidBtn").addEventListener("click", () => runRequest(true));
 $("verifyReceiptBtn").addEventListener("click", verifyOnChainReceipt);
 
-// Auto-detect local gateway health if served directly by tollgate-gateway
-fetch("/api/health").then((r) => r.ok ? r.json() : null).then((h) => {
-  if (h && h.rpc && h.realm) {
-    $("rpcInput").value = h.rpc;
-    $("realmInput").value = h.realm;
-  }
-}).catch(() => {}).finally(syncChain);
+// Only probe same-origin /api/health when served by a local tollgate-gateway (avoid noisy 404 on static GitHub Pages)
+const qp = new URLSearchParams(location.search);
+if (qp.get("gateway")) $("gatewayInput").value = qp.get("gateway");
+const isStaticHost = location.hostname.endsWith("github.io") || location.protocol === "file:";
+if (!isStaticHost) {
+  fetch("/api/health").then((r) => (r.ok ? r.json() : null)).then((h) => {
+    if (h && h.rpc && h.realm) {
+      $("rpcInput").value = h.rpc;
+      $("realmInput").value = h.realm;
+    }
+  }).catch(() => {}).finally(syncChain);
+} else {
+  syncChain();
+}

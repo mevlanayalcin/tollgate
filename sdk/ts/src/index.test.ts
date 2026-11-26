@@ -7,6 +7,10 @@ import {
   hashResource,
   receiptCommitment,
   verifyReceiptCommitment,
+  voucherMessage,
+  generateVoucherKeypair,
+  signVoucher,
+  verifyVoucher,
   decodePaymentRequired,
 } from "./index.ts";
 
@@ -40,8 +44,34 @@ test("canonical receipt commitment matches Gno and Go SDKs byte-for-byte", () =>
   const commitment = receiptCommitment(params);
   assert.equal(commitment.length, 64);
   assert.equal(verifyReceiptCommitment(commitment, params), true);
-  console.log("TS_CANONICAL_RES=" + resHash);
-  console.log("TS_CANONICAL_COMMITMENT=" + commitment);
+  assert.equal(commitment, "cfdf0dc69056f30d26543f18accf341c2f44d65fcd86a72a21f845c66010eafc");
+});
+
+test("Ed25519 voucher message, signing, verification, and tamper rejection", () => {
+  const kp = generateVoucherKeypair();
+  assert.equal(kp.publicKeyHex.length, 64);
+  assert.equal(kp.seedHex.length, 64);
+
+  const resHash = hashResource("GET /api/v1/oracle?pair=GNOT-USD");
+  const params = {
+    chainId: "onyx-1",
+    serviceId: 1n,
+    passId: 1n,
+    subId: 0n,
+    units: 10n,
+    nonce: "ts-voucher-001",
+    resourceHash: resHash,
+  };
+  assert.equal(
+    voucherMessage(params),
+    `tollgate-voucher-v1|6:onyx-1|1|1|0|10|14:ts-voucher-001|64:${resHash}|`
+  );
+
+  const sig = signVoucher(kp.seedHex, params);
+  assert.equal(sig.length, 128);
+  assert.equal(verifyVoucher(kp.publicKeyHex, sig, params), true);
+  assert.equal(verifyVoucher(kp.publicKeyHex, sig, { ...params, units: 11n }), false);
+  assert.equal(verifyVoucher(kp.publicKeyHex, sig, { ...params, nonce: "ts-voucher-002" }), false);
 });
 
 test("decodePaymentRequired decodes x402 v2 base64 header", () => {

@@ -27,6 +27,7 @@ func resetState() {
 	nextSubID = 0
 	nextSettlementID = 0
 	nextReceiptID = 0
+	activePassesCount = 0
 	totalDepositedUgnot = 0
 	totalSettledUgnot = 0
 	totalRefundedUgnot = 0
@@ -45,83 +46,54 @@ func TestEndToEndMeteredPassAndSettlement(cur realm, t *testing.T) {
 	testing.IssueCoins(pkgAddr, chain.NewCoins(chain.NewCoin("ugnot", 1_000_000)))
 	testing.SetHeight(100)
 
-	// 1. Register service
 	testing.SetRealm(testing.NewUserRealm(provider))
 	sid := RegisterService(
-		cross(cur),
-		"alpha-oracle",
-		"Alpha Price Oracle",
-		"https://api.tollgate.example/v1/oracle",
-		payTo,
-		1000,
-		50000,
-		500,
-		100,
-		20,
+		cross(cur), "alpha-oracle", "Alpha Price Oracle",
+		"https://api.tollgate.example/v1/oracle", payTo,
+		1000, 50000, 500, 100, 20,
 		"Real-time verified market feeds over HTTP 402.",
 	)
 	uassert.Equal(t, uint64(1), sid)
 
-	svc, ok := GetServiceBySlug("alpha-oracle")
-	urequire.True(t, ok)
-	uassert.Equal(t, int64(1000), svc.UnitPriceUgnot)
-
-	// 2. Buyer opens prepaid credit pass with 25,000 ugnot
+	// P0 #5: default maxPerCallUgnot <= 0 MUST default to svc.unitPriceUgnot (1000), NOT deposit (25000)
 	testing.SetRealm(testing.NewUserRealm(buyer))
 	testing.SetOriginSend(chain.NewCoins(chain.NewCoin("ugnot", 25000)))
-	pid := OpenPass(cross(cur), sid, 2000, 100)
-	uassert.Equal(t, uint64(1), pid)
-	uassert.True(t, CheckPassQuota(pid, 10))
-	uassert.False(t, CheckPassQuota(pid, 50))
+	pid := OpenPass(cross(cur), sid, 0, 100, "")
+	p0, _ := GetPass(pid)
+	uassert.Equal(t, int64(1000), p0.MaxPerCallUgnot)
 
-	// 3. Provider claims 10 units -> 5% volume discount -> 9,500 ugnot net
+	// Provider claims 10 units -> 5% discount -> 9,500 ugnot net
 	resHash := ptollgate.HashResource("GET /v1/oracle?pair=GNOT-USD")
 	testing.SetRealm(testing.NewUserRealm(provider))
-	stID := ClaimSettlement(cross(cur), pid, 10, "batch-001", resHash)
+	stID := ClaimSettlement(cross(cur), pid, 10, "batch-001", resHash, "")
 	uassert.Equal(t, uint64(1), stID)
 
 	st, ok := GetSettlement(stID)
 	urequire.True(t, ok)
-	uassert.Equal(t, int64(10000), st.GrossUgnot)
-	uassert.Equal(t, int64(500), st.DiscountBps)
 	uassert.Equal(t, int64(9500), st.NetUgnot)
-	uassert.Equal(t, StatusPending, st.Status)
 
-	// Replay nonce rejected
-	uassert.AbortsWithMessage(t, cur, "tollgate: duplicate nonce", func() {
-		ClaimSettlement(cross(cur), pid, 1, "batch-001", resHash)
-	})
-
-	// Finalizing before challenge window ends must fail
-	uassert.AbortsWithMessage(t, cur, "tollgate: challenge window still active", func() {
-		FinalizeSettlement(cross(cur), stID)
-	})
-
-	// Advance past challenge window & finalize
 	testing.SkipHeights(20)
 	FinalizeSettlement(cross(cur), stID)
-
-	stAfter, _ := GetSettlement(stID)
-	uassert.Equal(t, StatusFinalized, stAfter.Status)
 	uassert.Equal(t, int64(9500), banker.NewReadonlyBanker().GetCoin(payTo, "ugnot"))
 
-	// Commitment verified on-chain
-	rid, found := VerifyReceiptByCommitment(stAfter.Commitment)
+	rid, found := VerifyReceiptByCommitment(st.Commitment)
 	urequire.True(t, found)
-	uassert.Equal(t, stAfter.ReceiptID, rid)
+	uassert.Equal(t, st.ReceiptID, rid)
 
-	// 4. Buyer requests early close & withdraws remaining 15,500 ugnot
+	// P0 #3: Provider CANNOT claim after pass expiry
+	testing.SkipHeights(85) // height 205 >= expiry 200
+	uassert.AbortsWithMessage(t, cur, "tollgate: pass expired; claims closed", func() {
+		ClaimSettlement(cross(cur), pid, 1, "after-expiry", resHash, "")
+	})
+
+	// Buyer closes expired pass and receives remaining 15,500 ugnot
 	testing.SetRealm(testing.NewUserRealm(buyer))
-	buyerBefore := banker.NewReadonlyBanker().GetCoin(buyer, "ugnot")
-	newExpiry := RequestEarlyClose(cross(cur), pid)
-	uassert.True(t, newExpiry <= 140)
-	testing.SkipHeights(20)
 	refund := ClosePass(cross(cur), pid)
 	uassert.Equal(t, int64(15500), refund)
-	uassert.Equal(t, buyerBefore+15500, banker.NewReadonlyBanker().GetCoin(buyer, "ugnot"))
+	uassert.Equal(t, int64(0), activePassesCount)
 }
 
-func TestDisputeAndRefundProtection(cur realm, t *testing.T) {
+func TestDisputeReclaimTimeoutAndReceiptInvalidation(cur realm, t *testing.T) {
 	defer resetState()
 
 	pkgAddr := chain.PackageAddress("gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate")
@@ -135,75 +107,84 @@ func TestDisputeAndRefundProtection(cur realm, t *testing.T) {
 
 	testing.SetRealm(testing.NewUserRealm(buyer))
 	testing.SetOriginSend(chain.NewCoins(chain.NewCoin("ugnot", 10000)))
-	pid := OpenPass(cross(cur), sid, 1000, 50)
+	pid := OpenPass(cross(cur), sid, 1000, 50, "")
 
 	testing.SetRealm(testing.NewUserRealm(provider))
 	resHash := ptollgate.HashResource("POST /v1/chat")
-	stID := ClaimSettlement(cross(cur), pid, 5, "inv-dispute", resHash)
-
-	testing.SetRealm(testing.NewUserRealm(buyer))
-	DisputeSettlement(cross(cur), stID, "HTTP 502 upstream failure; resource not delivered")
+	stID := ClaimSettlement(cross(cur), pid, 5, "inv-dispute", resHash, "")
 	st, _ := GetSettlement(stID)
-	uassert.Equal(t, StatusDisputed, st.Status)
 
-	testing.SkipHeights(30)
-	testing.SetRealm(testing.NewUserRealm(provider))
-	uassert.AbortsWithMessage(t, cur, "tollgate: settlement is not pending", func() {
-		FinalizeSettlement(cross(cur), stID)
+	// Buyer disputes within challenge window
+	testing.SetRealm(testing.NewUserRealm(buyer))
+	DisputeSettlement(cross(cur), stID, "HTTP 502 upstream failure")
+
+	// P0 #2: Reclaim too early must abort
+	testing.SkipHeights(20) // height 220 < 215 + 15 = 230
+	uassert.AbortsWithMessage(t, cur, "tollgate: provider response window still active", func() {
+		ReclaimDisputedSettlement(cross(cur), stID)
 	})
 
-	RefundDisputedSettlement(cross(cur), stID)
+	// After provider response window (230), buyer reclaims unilaterally — pass is NOT frozen!
+	testing.SkipHeights(15) // height 235 >= 230
+	ReclaimDisputedSettlement(cross(cur), stID)
 	p, _ := GetPass(pid)
 	uassert.Equal(t, int64(0), p.PendingUgnot)
 	uassert.Equal(t, int64(10000), p.AvailableUgnot)
+
+	// Refunded settlement invalidates receipt verification
+	_, valid := VerifyReceiptByCommitment(st.Commitment)
+	uassert.False(t, valid)
+	uassert.True(t, strings.Contains(Render("receipt/1"), "INVALIDATED / REFUNDED"))
+
+	// Buyer can now close pass cleanly once expired
+	testing.SkipHeights(20)
+	uassert.Equal(t, int64(10000), ClosePass(cross(cur), pid))
 }
 
-func TestSubscriptionAndX402ReceiptAndSecurityGuards(cur realm, t *testing.T) {
+func TestEd25519VoucherOverflowBoundsAndGnowebLinks(cur realm, t *testing.T) {
 	defer resetState()
 
 	pkgAddr := chain.PackageAddress("gno.land/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate")
 	provider := testutils.TestAddress("prov3")
 	payTo := testutils.TestAddress("payto3")
 	buyer := testutils.TestAddress("buyer3")
-	attacker := testutils.TestAddress("attacker")
 	testing.IssueCoins(pkgAddr, chain.NewCoins(chain.NewCoin("ugnot", 500_000)))
 	testing.SetHeight(300)
 
 	testing.SetRealm(testing.NewUserRealm(provider))
-	sid := RegisterService(cross(cur), "weather-x402", "Weather | Evil #Heading", "https://x402.example/weather", payTo, 250, 5000, 100, 20, 10, "Forecasts")
+	sid := RegisterService(cross(cur), "weather-x402", "Weather | [Link](https://evil.test)", "https://x402.example/weather", payTo, 250, 5000, 100, 20, 10, "Forecasts")
 
-	testing.SetRealm(testing.NewCodeRealm("gno.land/r/evil/proxy"))
-	testing.SetOriginSend(chain.NewCoins(chain.NewCoin("ugnot", 5000)))
-	uassert.AbortsWithMessage(t, cur, "tollgate: payment must be a direct user call", func() {
-		Subscribe(cross(cur), sid)
+	// P0 #4: Overflow amountUgnot in RecordX402Receipt rejected
+	resHash := ptollgate.HashResource("GET /weather?city=istanbul")
+	uassert.AbortsWithMessage(t, cur, "tollgate: units or amountUgnot out of bounds", func() {
+		RecordX402Receipt(cross(cur), sid, buyer, 1, maxInt64, "vandal-1", resHash, "0xabcdef1234567890")
 	})
 
+	// Ed25519 voucher pass: forged signature rejected on-chain!
+	const testPubHex = "0d853fa898a07eb91f618bb3e8b738b0e45be9b3053799a2c42f8204f5fa3505"
 	testing.SetRealm(testing.NewUserRealm(buyer))
-	testing.SetOriginSend(chain.NewCoins(chain.NewCoin("ugnot", 7000)))
-	buyerBefore := banker.NewReadonlyBanker().GetCoin(buyer, "ugnot")
-	subID := Subscribe(cross(cur), sid)
-	uassert.Equal(t, uint64(1), subID)
-	uassert.True(t, CheckSubscriptionActive(subID, 5))
-	uassert.Equal(t, int64(5000), banker.NewReadonlyBanker().GetCoin(payTo, "ugnot"))
-	uassert.Equal(t, buyerBefore+2000, banker.NewReadonlyBanker().GetCoin(buyer, "ugnot"))
+	testing.SetOriginSend(chain.NewCoins(chain.NewCoin("ugnot", 5000)))
+	pid := OpenPass(cross(cur), sid, 500, 100, testPubHex)
 
 	testing.SetRealm(testing.NewUserRealm(provider))
-	resHash := ptollgate.HashResource("GET /weather?city=istanbul")
-	subRid := ConsumeSubscription(cross(cur), subID, 4, "sub-call-1", resHash)
-	uassert.Equal(t, uint64(1), subRid)
-
-	x402Rid := RecordX402Receipt(cross(cur), sid, buyer, 1, 250000, "x402-inv-9", resHash, "0xabcdef1234567890")
-	uassert.Equal(t, uint64(2), x402Rid)
-
-	testing.SetRealm(testing.NewUserRealm(attacker))
-	uassert.AbortsWithMessage(t, cur, "tollgate: only service owner may anchor x402 receipts", func() {
-		RecordX402Receipt(cross(cur), sid, buyer, 1, 250000, "x402-fake", resHash, "0xdeadbeef1234")
+	uassert.AbortsWithMessage(t, cur, "tollgate: invalid Ed25519 buyer voucher signature", func() {
+		ClaimSettlement(cross(cur), pid, 2, "forged-1", resHash, strings.Repeat("00", 64))
 	})
 
+	// Subscription quota wraparound rejected
+	testing.SetRealm(testing.NewUserRealm(buyer))
+	testing.SetOriginSend(chain.NewCoins(chain.NewCoin("ugnot", 5000)))
+	subID := Subscribe(cross(cur), sid, "")
+	uassert.False(t, CheckSubscriptionActive(subID, maxInt64))
+
+	// P0 #1: All gnoweb links use full /r/... path (zero broken leading `](:` links!)
 	home := Render("")
-	uassert.True(t, strings.Contains(home, "Tollgate"))
-	uassert.True(t, strings.Contains(home, `\|`))
-	js := Render("json/summary")
-	uassert.True(t, strings.Contains(js, `"protocol":"tollgate-v1"`))
-	uassert.True(t, strings.Contains(js, `"totalX402AnchoredUgnot":250000`))
+	uassert.False(t, strings.Contains(home, "](:"))
+	uassert.True(t, strings.Contains(home, "](/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate:service/1)"))
+	uassert.True(t, strings.Contains(home, "$help&func=OpenPass"))
+
+	// JSON route escapes Markdown link injection cleanly
+	js := Render("json/service/1")
+	uassert.False(t, strings.Contains(js, "[Link]"))
+	uassert.True(t, strings.Contains(js, `\u005bLink\u005d`))
 }

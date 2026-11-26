@@ -1,6 +1,7 @@
 // Package tollgate implements the on-chain HTTP 402 (x402) metering vault,
-// prepaid credit passes, subscription quotas, challenge-window settlements,
-// and cryptographic receipt anchoring for Gno.land.
+// Ed25519-authenticated prepaid credit passes, fixed-window subscriptions,
+// challenge-window settlements with buyer reclaim protection, and verifiable
+// SHA-256 receipt anchoring for Gno.land.
 package tollgate
 
 import (
@@ -8,6 +9,8 @@ import (
 	"chain/banker"
 	"chain/runtime"
 	"chain/runtime/unsafe"
+	"crypto/ed25519"
+	"encoding/hex"
 	"strconv"
 	"strings"
 
@@ -27,13 +30,22 @@ func mustDirectUserPayment(cur realm) int64 {
 	if !cur.Previous().IsUserCall() {
 		panic("tollgate: payment must be a direct user call")
 	}
-	// Paired with IsUserCall(), OriginSend reflects coins credited directly
-	// to this realm in the top-level MsgCall envelope.
 	sent := unsafe.OriginSend().AmountOf("ugnot")
 	if sent <= 0 {
 		panic("tollgate: positive ugnot payment required")
 	}
 	return sent
+}
+
+// satAdd prevents silent int64 wraparound on telemetry/revenue accumulators.
+func satAdd(a, b int64) int64 {
+	if b <= 0 {
+		return a
+	}
+	if a > maxInt64-b {
+		return maxInt64
+	}
+	return a + b
 }
 
 func idKey(id uint64) string {
@@ -42,6 +54,71 @@ func idKey(id uint64) string {
 
 func nonceKey(serviceID uint64, nonce string) string {
 	return strconv.FormatUint(serviceID, 10) + ":" + nonce
+}
+
+func appendLP(b *strings.Builder, s string) {
+	b.WriteString(strconv.Itoa(len(s)))
+	b.WriteByte(':')
+	b.WriteString(s)
+	b.WriteByte('|')
+}
+
+// VoucherMessage builds the canonical domain-separated byte message signed by
+// a buyer's Ed25519 voucher key for off-chain HTTP authentication and optional
+// on-chain ClaimSettlement / ConsumeSubscription cryptographic proof.
+func VoucherMessage(
+	chainID string,
+	serviceID uint64,
+	passID uint64,
+	subID uint64,
+	units int64,
+	nonce string,
+	resourceHash string,
+) string {
+	var b strings.Builder
+	b.WriteString(VoucherDomain)
+	b.WriteByte('|')
+	appendLP(&b, chainID)
+	b.WriteString(strconv.FormatUint(serviceID, 10))
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatUint(passID, 10))
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatUint(subID, 10))
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatInt(units, 10))
+	b.WriteByte('|')
+	appendLP(&b, nonce)
+	appendLP(&b, resourceHash)
+	return b.String()
+}
+
+func verifyBuyerVoucher(pubKeyHex string, sigHex string, msg string) bool {
+	if !ptollgate.IsValidHexDigest(pubKeyHex) {
+		return false
+	}
+	if len(sigHex) != 128 {
+		return false
+	}
+	pub, err := hex.DecodeString(pubKeyHex)
+	if err != nil || len(pub) != 32 {
+		return false
+	}
+	sig, err := hex.DecodeString(sigHex)
+	if err != nil || len(sig) != 64 {
+		return false
+	}
+	return ed25519.Verify(pub, []byte(msg), sig)
+}
+
+func validateOptionalPubKey(pubKeyHex string) string {
+	pubKeyHex = strings.TrimSpace(strings.ToLower(pubKeyHex))
+	if pubKeyHex == "" {
+		return ""
+	}
+	if !ptollgate.IsValidHexDigest(pubKeyHex) {
+		panic("tollgate: invalid voucherPubKeyHex (expect empty or 64-char lowercase Ed25519 hex)")
+	}
+	return pubKeyHex
 }
 
 func getServiceRecord(id uint64) *serviceRecord {
@@ -138,13 +215,13 @@ func RegisterService(
 	if !payTo.IsValid() {
 		payTo = owner
 	}
-	if unitPriceUgnot <= 0 {
-		panic("tollgate: unitPriceUgnot must be positive")
+	if unitPriceUgnot <= 0 || unitPriceUgnot > maxAmountPerTx {
+		panic("tollgate: unitPriceUgnot out of bounds")
 	}
-	if subPriceUgnot < 0 {
-		panic("tollgate: subPriceUgnot cannot be negative")
+	if subPriceUgnot < 0 || subPriceUgnot > maxAmountPerTx {
+		panic("tollgate: subPriceUgnot out of bounds")
 	}
-	if subPriceUgnot > 0 && (subBlocks < minExpiryBlocks || subQuota <= 0) {
+	if subPriceUgnot > 0 && (subBlocks < minExpiryBlocks || subBlocks > maxExpiryBlocks || subQuota <= 0 || subQuota > maxUnitsPerTx) {
 		panic("tollgate: subscription requires valid subBlocks and subQuota")
 	}
 	if challengeBlocks < ptollgate.MinChallengeBlocks || challengeBlocks > ptollgate.MaxChallengeBlocks {
@@ -199,10 +276,10 @@ func UpdateServicePricing(
 	if cur.Previous().Address() != svc.owner {
 		panic("tollgate: only service owner may update pricing")
 	}
-	if unitPriceUgnot <= 0 || subPriceUgnot < 0 {
+	if unitPriceUgnot <= 0 || unitPriceUgnot > maxAmountPerTx || subPriceUgnot < 0 || subPriceUgnot > maxAmountPerTx {
 		panic("tollgate: invalid pricing parameters")
 	}
-	if subPriceUgnot > 0 && (subBlocks < minExpiryBlocks || subQuota <= 0) {
+	if subPriceUgnot > 0 && (subBlocks < minExpiryBlocks || subBlocks > maxExpiryBlocks || subQuota <= 0 || subQuota > maxUnitsPerTx) {
 		panic("tollgate: subscription requires valid subBlocks and subQuota")
 	}
 	svc.unitPriceUgnot = unitPriceUgnot
@@ -237,8 +314,16 @@ func SetServicePaused(cur realm, serviceID uint64, paused bool) {
 }
 
 // OpenPass locks buyer ugnot into an on-chain prepaid credit vault for high-frequency
-// metered API calls without per-call L1 latency or sequence-race exposure.
-func OpenPass(cur realm, serviceID uint64, maxPerCallUgnot int64, expiryBlocks int64) uint64 {
+// metered API calls. When voucherPubKeyHex (64-char Ed25519 hex) is set, both the
+// HTTP gateway AND on-chain ClaimSettlement verify buyer Ed25519 voucher signatures.
+// If maxPerCallUgnot <= 0, it safely defaults to the service's current unitPriceUgnot.
+func OpenPass(
+	cur realm,
+	serviceID uint64,
+	maxPerCallUgnot int64,
+	expiryBlocks int64,
+	voucherPubKeyHex string,
+) uint64 {
 	sent := mustDirectUserPayment(cur)
 	svc := getServiceRecord(serviceID)
 	if svc == nil {
@@ -250,12 +335,14 @@ func OpenPass(cur realm, serviceID uint64, maxPerCallUgnot int64, expiryBlocks i
 	if expiryBlocks < minExpiryBlocks || expiryBlocks > maxExpiryBlocks {
 		panic("tollgate: expiryBlocks out of bounds")
 	}
+	// P0 #5: Safe default per-call cap equals current unitPriceUgnot (never whole deposit).
 	if maxPerCallUgnot <= 0 {
-		maxPerCallUgnot = sent
+		maxPerCallUgnot = svc.unitPriceUgnot
 	}
 	if maxPerCallUgnot < svc.unitPriceUgnot {
 		panic("tollgate: maxPerCallUgnot below service unit price")
 	}
+	cleanPub := validateOptionalPubKey(voucherPubKeyHex)
 
 	buyer := cur.Previous().Address()
 	sessAddr, _, _, isSess := runtime.GetSessionInfo()
@@ -272,9 +359,11 @@ func OpenPass(cur realm, serviceID uint64, maxPerCallUgnot int64, expiryBlocks i
 		openedHeight:    height,
 		usedSessionKey:  isSess,
 		sessionKeyAddr:  sessAddr,
+		voucherPubKey:   cleanPub,
 	}
 	passes.Set(pid.Binary(), rec)
-	totalDepositedUgnot += sent
+	activePassesCount++
+	totalDepositedUgnot = satAdd(totalDepositedUgnot, sent)
 
 	chain.Emit(
 		"PassOpened",
@@ -303,6 +392,9 @@ func TopUpPass(cur realm, passID uint64, extendBlocks int64) {
 	if extendBlocks < 0 || extendBlocks > maxExpiryBlocks {
 		panic("tollgate: invalid extendBlocks")
 	}
+	if p.depositUgnot > maxInt64-sent {
+		panic("tollgate: deposit overflow")
+	}
 	p.depositUgnot += sent
 	if extendBlocks > 0 {
 		base := p.expiryHeight
@@ -311,7 +403,7 @@ func TopUpPass(cur realm, passID uint64, extendBlocks int64) {
 		}
 		p.expiryHeight = base + extendBlocks
 	}
-	totalDepositedUgnot += sent
+	totalDepositedUgnot = satAdd(totalDepositedUgnot, sent)
 
 	chain.Emit(
 		"PassToppedUp",
@@ -376,8 +468,11 @@ func ClosePass(cur realm, passID uint64) int64 {
 		panic(err.Error())
 	}
 	p.closed = true
+	if activePassesCount > 0 {
+		activePassesCount--
+	}
 	if refund > 0 {
-		totalRefundedUgnot += refund
+		totalRefundedUgnot = satAdd(totalRefundedUgnot, refund)
 		b := banker.NewBanker(banker.BankerTypeRealmSend, cur)
 		b.SendCoins(cur.Address(), p.buyer, chain.NewCoins(chain.NewCoin("ugnot", refund)))
 	}
@@ -391,9 +486,9 @@ func ClosePass(cur realm, passID uint64) int64 {
 	return refund
 }
 
-// Subscribe purchases a fixed-window quota subscription and pays the service
-// provider immediately via BankerTypeRealmSend.
-func Subscribe(cur realm, serviceID uint64) uint64 {
+// Subscribe purchases a fixed-window quota subscription, optionally binds a
+// buyer Ed25519 voucher public key, and pays the service provider immediately.
+func Subscribe(cur realm, serviceID uint64, voucherPubKeyHex string) uint64 {
 	sent := mustDirectUserPayment(cur)
 	svc := getServiceRecord(serviceID)
 	if svc == nil {
@@ -408,6 +503,7 @@ func Subscribe(cur realm, serviceID uint64) uint64 {
 	if sent < svc.subPriceUgnot {
 		panic("tollgate: insufficient ugnot for subscription")
 	}
+	cleanPub := validateOptionalPubKey(voucherPubKeyHex)
 
 	buyer := cur.Previous().Address()
 	sessAddr, _, _, isSess := runtime.GetSessionInfo()
@@ -425,10 +521,11 @@ func Subscribe(cur realm, serviceID uint64) uint64 {
 		expiryHeight:   height + svc.subBlocks,
 		usedSessionKey: isSess,
 		sessionKeyAddr: sessAddr,
+		voucherPubKey:  cleanPub,
 	}
 	subs.Set(sid.Binary(), rec)
-	svc.totalRevenue += svc.subPriceUgnot
-	totalSubRevenueUgnot += svc.subPriceUgnot
+	svc.escrowedRevenue = satAdd(svc.escrowedRevenue, svc.subPriceUgnot)
+	totalSubRevenueUgnot = satAdd(totalSubRevenueUgnot, svc.subPriceUgnot)
 
 	b := banker.NewBanker(banker.BankerTypeRealmSend, cur)
 	b.SendCoins(cur.Address(), svc.payTo, chain.NewCoins(chain.NewCoin("ugnot", svc.subPriceUgnot)))
@@ -448,14 +545,16 @@ func Subscribe(cur realm, serviceID uint64) uint64 {
 	return rec.id
 }
 
-// ConsumeSubscription records metered quota usage against an active subscription
-// and anchors a verifiable SHA-256 usage receipt on chain.
+// ConsumeSubscription records metered quota usage against an active subscription.
+// If the subscription registered a voucherPubKey, buyerSigHex MUST be a valid
+// Ed25519 signature over VoucherMessage(...).
 func ConsumeSubscription(
 	cur realm,
 	subID uint64,
 	units int64,
 	nonce string,
 	resourceHash string,
+	buyerSigHex string,
 ) uint64 {
 	mustCurrent(cur)
 	sub := getSubRecord(subID)
@@ -469,7 +568,8 @@ func ConsumeSubscription(
 	if runtime.ChainHeight() > sub.expiryHeight {
 		panic("tollgate: subscription expired")
 	}
-	if units <= 0 || sub.quotaUsed+units > sub.quotaTotal {
+	// P0 #4: Overflow-safe quota check (never wraps negative).
+	if units <= 0 || units > maxUnitsPerTx || units > sub.quotaTotal-sub.quotaUsed {
 		panic("tollgate: subscription quota exceeded")
 	}
 	if !ptollgate.ValidateNonce(nonce) {
@@ -483,8 +583,17 @@ func ConsumeSubscription(
 		panic("tollgate: duplicate nonce")
 	}
 
+	buyerSigned := false
+	if sub.voucherPubKey != "" {
+		msg := VoucherMessage(runtime.ChainID(), sub.serviceID, 0, sub.id, units, nonce, resourceHash)
+		if !verifyBuyerVoucher(sub.voucherPubKey, buyerSigHex, msg) {
+			panic("tollgate: invalid Ed25519 buyer voucher signature")
+		}
+		buyerSigned = true
+	}
+
 	sub.quotaUsed += units
-	svc.totalCalls += units
+	svc.totalCalls = satAdd(svc.totalCalls, units)
 
 	commitment := ptollgate.ReceiptCommitment(
 		runtime.ChainID(),
@@ -512,6 +621,7 @@ func ConsumeSubscription(
 		resourceHash: resourceHash,
 		commitment:   commitment,
 		height:       runtime.ChainHeight(),
+		buyerSigned:  buyerSigned,
 	}
 	receipts.Set(rid.Binary(), r)
 	receiptHashIndex.Set(commitment, r.id)
@@ -528,14 +638,15 @@ func ConsumeSubscription(
 }
 
 // ClaimSettlement lets the service provider submit a metered usage batch against
-// a prepaid pass. Funds move into pending escrow for challengeBlocks so the buyer
-// can audit the SHA-256 commitment and dispute overcharges.
+// a prepaid pass BEFORE pass expiry. If the pass bound an Ed25519 voucherPubKey,
+// buyerSigHex is verified directly on-chain via crypto/ed25519.Verify.
 func ClaimSettlement(
 	cur realm,
 	passID uint64,
 	units int64,
 	nonce string,
 	resourceHash string,
+	buyerSigHex string,
 ) uint64 {
 	mustCurrent(cur)
 	p := getPassRecord(passID)
@@ -545,9 +656,16 @@ func ClaimSettlement(
 	if p.closed {
 		panic("tollgate: pass is closed")
 	}
+	// P0 #3: Provider cannot file new claims once pass has expired (protects ClosePass).
+	if runtime.ChainHeight() >= p.expiryHeight {
+		panic("tollgate: pass expired; claims closed")
+	}
 	svc := getServiceRecord(p.serviceID)
 	if cur.Previous().Address() != svc.owner {
 		panic("tollgate: only service owner may claim settlement")
+	}
+	if units <= 0 || units > maxUnitsPerTx {
+		panic("tollgate: units out of bounds")
 	}
 	if !ptollgate.ValidateNonce(nonce) {
 		panic("tollgate: invalid nonce")
@@ -560,11 +678,21 @@ func ClaimSettlement(
 		panic("tollgate: duplicate nonce")
 	}
 
+	buyerSigned := false
+	if p.voucherPubKey != "" {
+		msg := VoucherMessage(runtime.ChainID(), svc.id, p.id, 0, units, nonce, resourceHash)
+		if !verifyBuyerVoucher(p.voucherPubKey, buyerSigHex, msg) {
+			panic("tollgate: invalid Ed25519 buyer voucher signature")
+		}
+		buyerSigned = true
+	}
+
 	charge, err := ptollgate.ComputeCharge(svc.unitPriceUgnot, units)
 	if err != nil {
 		panic(err.Error())
 	}
-	if charge.NetUgnot > p.maxPerCallUgnot*units {
+	// Overflow-safe per-call ceiling check: netUgnot <= maxPerCallUgnot * units
+	if p.maxPerCallUgnot <= maxInt64/units && charge.NetUgnot > p.maxPerCallUgnot*units {
 		panic("tollgate: batch exceeds pass maxPerCallUgnot ceiling")
 	}
 	avail, err := ptollgate.ComputeAvailable(p.depositUgnot, p.spentUgnot, p.pendingUgnot)
@@ -589,11 +717,13 @@ func ClaimSettlement(
 	)
 
 	rid := nextReceiptID.Next()
+	stID := nextSettlementID.Next()
 	r := &receiptRecord{
 		id:           uint64(rid),
 		rail:         RailMeteredPass,
 		serviceID:    svc.id,
 		passID:       p.id,
+		settlementID: uint64(stID),
 		buyer:        p.buyer,
 		provider:     svc.payTo,
 		units:        units,
@@ -602,12 +732,12 @@ func ClaimSettlement(
 		resourceHash: resourceHash,
 		commitment:   commitment,
 		height:       height,
+		buyerSigned:  buyerSigned,
 	}
 	receipts.Set(rid.Binary(), r)
 	receiptHashIndex.Set(commitment, r.id)
 	nonceUsed.Set(nk, r.id)
 
-	stID := nextSettlementID.Next()
 	st := &settlementRecord{
 		id:            uint64(stID),
 		serviceID:     svc.id,
@@ -625,6 +755,7 @@ func ClaimSettlement(
 		challengeEnd:  height + svc.challengeBlocks,
 		status:        StatusPending,
 		receiptID:     r.id,
+		buyerSigned:   buyerSigned,
 	}
 	settlements.Set(stID.Binary(), st)
 	p.pendingUgnot += charge.NetUgnot
@@ -698,6 +829,37 @@ func RefundDisputedSettlement(cur realm, settlementID uint64) {
 	)
 }
 
+// ReclaimDisputedSettlement (P0 #2) lets the buyer unconditionally unlock funds
+// from a disputed settlement if the provider does not refund within one additional
+// challenge window (st.challengeEnd + svc.challengeBlocks), preventing pass lockup.
+func ReclaimDisputedSettlement(cur realm, settlementID uint64) {
+	mustCurrent(cur)
+	st := getSettlementRecord(settlementID)
+	if st == nil {
+		panic("tollgate: settlement not found")
+	}
+	if st.status != StatusDisputed {
+		panic("tollgate: settlement is not disputed")
+	}
+	if cur.Previous().Address() != st.buyer {
+		panic("tollgate: only buyer may reclaim disputed settlement")
+	}
+	svc := getServiceRecord(st.serviceID)
+	if runtime.ChainHeight() < st.challengeEnd+svc.challengeBlocks {
+		panic("tollgate: provider response window still active")
+	}
+	p := getPassRecord(st.passID)
+	p.pendingUgnot -= st.netUgnot
+	st.status = StatusRefunded
+
+	chain.Emit(
+		"SettlementReclaimed",
+		"settlement_id", strconv.FormatUint(settlementID, 10),
+		"pass_id", strconv.FormatUint(st.passID, 10),
+		"amount_ugnot", strconv.FormatInt(st.netUgnot, 10),
+	)
+}
+
 // FinalizeSettlement releases an undisputed settlement's locked ugnot to the
 // service payTo address once the challenge window has passed.
 func FinalizeSettlement(cur realm, settlementID uint64) {
@@ -718,10 +880,10 @@ func FinalizeSettlement(cur realm, settlementID uint64) {
 
 	p.pendingUgnot -= st.netUgnot
 	p.spentUgnot += st.netUgnot
-	p.settledCalls += st.units
-	svc.totalCalls += st.units
-	svc.totalRevenue += st.netUgnot
-	totalSettledUgnot += st.netUgnot
+	p.settledCalls = satAdd(p.settledCalls, st.units)
+	svc.totalCalls = satAdd(svc.totalCalls, st.units)
+	svc.escrowedRevenue = satAdd(svc.escrowedRevenue, st.netUgnot)
+	totalSettledUgnot = satAdd(totalSettledUgnot, st.netUgnot)
 	st.status = StatusFinalized
 
 	b := banker.NewBanker(banker.BankerTypeRealmSend, cur)
@@ -736,7 +898,7 @@ func FinalizeSettlement(cur realm, settlementID uint64) {
 }
 
 // RecordX402Receipt anchors an external gnolang/x402 direct bank-send HTTP 402
-// settlement on chain with canonical commitment + anti-replay nonce indexing.
+// settlement on chain (provider-attested, tracked separately from escrowed TVL).
 func RecordX402Receipt(
 	cur realm,
 	serviceID uint64,
@@ -758,8 +920,9 @@ func RecordX402Receipt(
 	if !buyer.IsValid() {
 		panic("tollgate: invalid buyer address")
 	}
-	if units <= 0 || amountUgnot <= 0 {
-		panic("tollgate: units and amountUgnot must be positive")
+	// P0 #4: Bound units & amountUgnot to prevent telemetry overflow vandalism.
+	if units <= 0 || units > maxUnitsPerTx || amountUgnot <= 0 || amountUgnot > maxAmountPerTx {
+		panic("tollgate: units or amountUgnot out of bounds")
 	}
 	if !ptollgate.ValidateNonce(nonce) {
 		panic("tollgate: invalid nonce")
@@ -806,9 +969,9 @@ func RecordX402Receipt(
 	receipts.Set(rid.Binary(), r)
 	receiptHashIndex.Set(commitment, r.id)
 	nonceUsed.Set(nk, r.id)
-	svc.totalCalls += units
-	svc.totalRevenue += amountUgnot
-	totalX402AnchoredUgnot += amountUgnot
+	svc.totalCalls = satAdd(svc.totalCalls, units)
+	svc.x402AttestedRevenue = satAdd(svc.x402AttestedRevenue, amountUgnot)
+	totalX402AnchoredUgnot = satAdd(totalX402AnchoredUgnot, amountUgnot)
 
 	chain.Emit(
 		"X402ReceiptAnchored",
@@ -830,22 +993,23 @@ func GetService(serviceID uint64) (ServiceView, bool) {
 		return ServiceView{}, false
 	}
 	return ServiceView{
-		ID:              svc.id,
-		Slug:            svc.slug,
-		Name:            svc.name,
-		Description:     svc.description,
-		EndpointURL:     svc.endpointURL,
-		Owner:           svc.owner,
-		PayTo:           svc.payTo,
-		UnitPriceUgnot:  svc.unitPriceUgnot,
-		SubPriceUgnot:   svc.subPriceUgnot,
-		SubBlocks:       svc.subBlocks,
-		SubQuota:        svc.subQuota,
-		ChallengeBlocks: svc.challengeBlocks,
-		Paused:          svc.paused,
-		CreatedHeight:   svc.createdHeight,
-		TotalCalls:      svc.totalCalls,
-		TotalRevenue:    svc.totalRevenue,
+		ID:                  svc.id,
+		Slug:                svc.slug,
+		Name:                svc.name,
+		Description:         svc.description,
+		EndpointURL:         svc.endpointURL,
+		Owner:               svc.owner,
+		PayTo:               svc.payTo,
+		UnitPriceUgnot:      svc.unitPriceUgnot,
+		SubPriceUgnot:       svc.subPriceUgnot,
+		SubBlocks:           svc.subBlocks,
+		SubQuota:            svc.subQuota,
+		ChallengeBlocks:     svc.challengeBlocks,
+		Paused:              svc.paused,
+		CreatedHeight:       svc.createdHeight,
+		TotalCalls:          svc.totalCalls,
+		EscrowedRevenue:     svc.escrowedRevenue,
+		X402AttestedRevenue: svc.x402AttestedRevenue,
 	}, true
 }
 
@@ -877,6 +1041,7 @@ func GetPass(passID uint64) (PassView, bool) {
 		Closed:          p.closed,
 		UsedSessionKey:  p.usedSessionKey,
 		SessionKeyAddr:  p.sessionKeyAddr,
+		VoucherPubKey:   p.voucherPubKey,
 		SettledCalls:    p.settledCalls,
 	}, true
 }
@@ -899,6 +1064,7 @@ func GetSubscription(subID uint64) (SubscriptionView, bool) {
 		StartHeight:    s.startHeight,
 		ExpiryHeight:   s.expiryHeight,
 		Active:         active,
+		VoucherPubKey:  s.voucherPubKey,
 	}, true
 }
 
@@ -925,7 +1091,20 @@ func GetSettlement(settlementID uint64) (SettlementView, bool) {
 		Status:        st.status,
 		DisputeReason: st.disputeReason,
 		ReceiptID:     st.receiptID,
+		BuyerSigned:   st.buyerSigned,
 	}, true
+}
+
+func receiptSettlementStatus(r *receiptRecord) string {
+	if r.settlementID > 0 {
+		if st := getSettlementRecord(r.settlementID); st != nil {
+			return st.status
+		}
+	}
+	if r.rail == RailX402Direct {
+		return "provider-attested"
+	}
+	return "recorded"
 }
 
 func GetReceipt(receiptID uint64) (ReceiptView, bool) {
@@ -934,25 +1113,28 @@ func GetReceipt(receiptID uint64) (ReceiptView, bool) {
 		return ReceiptView{}, false
 	}
 	return ReceiptView{
-		ID:           r.id,
-		Rail:         r.rail,
-		ServiceID:    r.serviceID,
-		PassID:       r.passID,
-		SubID:        r.subID,
-		Buyer:        r.buyer,
-		Provider:     r.provider,
-		Units:        r.units,
-		AmountUgnot:  r.amountUgnot,
-		Nonce:        r.nonce,
-		ResourceHash: r.resourceHash,
-		Commitment:   r.commitment,
-		TxHash:       r.txHash,
-		Height:       r.height,
+		ID:               r.id,
+		Rail:             r.rail,
+		ServiceID:        r.serviceID,
+		PassID:           r.passID,
+		SubID:            r.subID,
+		SettlementID:     r.settlementID,
+		SettlementStatus: receiptSettlementStatus(r),
+		Buyer:            r.buyer,
+		Provider:         r.provider,
+		Units:            r.units,
+		AmountUgnot:      r.amountUgnot,
+		Nonce:            r.nonce,
+		ResourceHash:     r.resourceHash,
+		Commitment:       r.commitment,
+		TxHash:           r.txHash,
+		Height:           r.height,
+		BuyerSigned:      r.buyerSigned,
 	}, true
 }
 
 // VerifyReceiptByCommitment checks whether a canonical SHA-256 receipt digest
-// has been anchored on chain and returns its receipt ID.
+// is anchored on chain AND has NOT been refunded/invalidated by a dispute.
 func VerifyReceiptByCommitment(commitmentHex string) (uint64, bool) {
 	if !ptollgate.IsValidHexDigest(commitmentHex) {
 		return 0, false
@@ -961,14 +1143,21 @@ func VerifyReceiptByCommitment(commitmentHex string) (uint64, bool) {
 	if v == nil {
 		return 0, false
 	}
-	return v.(uint64), true
+	rid := v.(uint64)
+	r := getReceiptRecord(rid)
+	if r == nil {
+		return 0, false
+	}
+	if receiptSettlementStatus(r) == StatusRefunded {
+		return rid, false
+	}
+	return rid, true
 }
 
-// CheckPassQuota is a fast read-only helper for HTTP gateways (via vm/qeval)
-// verifying that a pass is open, unexpired, and covers a requested batch size.
+// CheckPassQuota is a fast read-only helper for HTTP gateways (via vm/qeval).
 func CheckPassQuota(passID uint64, units int64) bool {
 	p := getPassRecord(passID)
-	if p == nil || p.closed || units <= 0 {
+	if p == nil || p.closed || units <= 0 || units > maxUnitsPerTx {
 		return false
 	}
 	if runtime.ChainHeight() >= p.expiryHeight {
@@ -982,7 +1171,7 @@ func CheckPassQuota(passID uint64, units int64) bool {
 	if err != nil {
 		return false
 	}
-	if charge.NetUgnot > p.maxPerCallUgnot*units {
+	if p.maxPerCallUgnot <= maxInt64/units && charge.NetUgnot > p.maxPerCallUgnot*units {
 		return false
 	}
 	avail, err := ptollgate.ComputeAvailable(p.depositUgnot, p.spentUgnot, p.pendingUgnot)
@@ -993,20 +1182,19 @@ func CheckPassQuota(passID uint64, units int64) bool {
 }
 
 // CheckSubscriptionActive verifies via vm/qeval whether a subscription has
-// remaining quota and has not expired.
+// remaining quota and has not expired (overflow-safe).
 func CheckSubscriptionActive(subID uint64, units int64) bool {
 	s := getSubRecord(subID)
-	if s == nil || units <= 0 {
+	if s == nil || units <= 0 || units > maxUnitsPerTx {
 		return false
 	}
 	if runtime.ChainHeight() > s.expiryHeight {
 		return false
 	}
-	return s.quotaUsed+units <= s.quotaTotal
+	return units <= s.quotaTotal-s.quotaUsed
 }
 
-// VaultBalanceUgnot returns the live ugnot locked in this realm using single-denom
-// GetCoin (O(1) store read, immune to unsolicited-denom GetCoins gas DoS).
+// VaultBalanceUgnot returns the live ugnot locked in this realm using O(1) GetCoin.
 func VaultBalanceUgnot() int64 {
 	pkgAddr := chain.PackageAddress(runtime.ChainDomain() + "/r/g1zt8w45ecxhlsdse7hd5gwr6xzcaxy9zsej6hl2/tollgate")
 	return banker.NewReadonlyBanker().GetCoin(pkgAddr, "ugnot")

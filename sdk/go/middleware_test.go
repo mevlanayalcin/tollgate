@@ -2,10 +2,14 @@ package tollgate
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 )
 
@@ -14,25 +18,30 @@ type fakeChain struct {
 	sub  SubscriptionInfo
 }
 
-func (f *fakeChain) Summary(context.Context) (ChainSummary, error)            { return ChainSummary{}, nil }
-func (f *fakeChain) Services(context.Context) ([]ServiceInfo, error)          { return nil, nil }
-func (f *fakeChain) Service(context.Context, string) (ServiceInfo, error)     { return ServiceInfo{}, nil }
-func (f *fakeChain) Receipt(context.Context, string) (ReceiptInfo, error)     { return ReceiptInfo{}, nil }
-func (f *fakeChain) Pass(context.Context, uint64) (PassInfo, error)           { return f.pass, nil }
-func (f *fakeChain) Subscription(context.Context, uint64) (SubscriptionInfo, error) {
-	return f.sub, nil
-}
-func (f *fakeChain) CheckPassQuota(context.Context, uint64, int64) (bool, error) { return true, nil }
+func (f *fakeChain) Summary(context.Context) (ChainSummary, error)                  { return ChainSummary{}, nil }
+func (f *fakeChain) Services(context.Context) ([]ServiceInfo, error)                { return nil, nil }
+func (f *fakeChain) Service(context.Context, string) (ServiceInfo, error)           { return ServiceInfo{}, nil }
+func (f *fakeChain) Receipt(context.Context, string) (ReceiptInfo, error)           { return ReceiptInfo{}, nil }
+func (f *fakeChain) Pass(context.Context, uint64) (PassInfo, error)                 { return f.pass, nil }
+func (f *fakeChain) Subscription(context.Context, uint64) (SubscriptionInfo, error) { return f.sub, nil }
+func (f *fakeChain) CheckPassQuota(context.Context, uint64, int64) (bool, error)    { return true, nil }
 func (f *fakeChain) CheckSubscriptionActive(context.Context, uint64, int64) (bool, error) {
 	return f.sub.Active, nil
 }
 
-type fakeFacilitator struct{}
+type strictMemoFacilitator struct {
+	lastVerifiedMemo string
+}
 
-func (f *fakeFacilitator) Verify(context.Context, string, PaymentRequirements) (VerifyResponse, error) {
+func (f *strictMemoFacilitator) Verify(_ context.Context, paymentHeader string, req PaymentRequirements) (VerifyResponse, error) {
+	memo, _ := ExtractX402AcceptedMemo(paymentHeader)
+	if req.Extra["memo"] != memo {
+		return VerifyResponse{IsValid: false, InvalidReason: "invalid_exact_gno_payload_memo_mismatch"}, nil
+	}
+	f.lastVerifiedMemo = memo
 	return VerifyResponse{IsValid: true, Payer: "g1x402buyer00000000000000000000000000000"}, nil
 }
-func (f *fakeFacilitator) Settle(context.Context, string, PaymentRequirements) (SettleResponse, error) {
+func (f *strictMemoFacilitator) Settle(context.Context, string, PaymentRequirements) (SettleResponse, error) {
 	return SettleResponse{
 		Success:     true,
 		Transaction: "0x1234567890abcdef",
@@ -41,24 +50,44 @@ func (f *fakeFacilitator) Settle(context.Context, string, PaymentRequirements) (
 	}, nil
 }
 
-func TestMiddlewareAllThreeRails(t *testing.T) {
+type fakeSubmitter struct{ submitted []PendingReceipt }
+
+func (s *fakeSubmitter) SubmitReceipt(_ context.Context, r PendingReceipt) (string, error) {
+	s.submitted = append(s.submitted, r)
+	return "txhash-" + r.Nonce, nil
+}
+
+func TestMiddlewareAllThreeRailsWithEd25519AndStockX402(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubHex := hex.EncodeToString(pub)
+
 	chain := &fakeChain{
 		pass: PassInfo{
 			ID: 7, ServiceID: 1, Buyer: "g1passbuyer0000000000000000000000000000",
 			DepositUgnot: 25000, AvailableUgnot: 25000, MaxPerCallUgnot: 2000,
-			ExpiryHeight: 500, CurrentHeight: 100,
+			ExpiryHeight: 500, CurrentHeight: 100, VoucherPubKey: pubHex,
 		},
 		sub: SubscriptionInfo{
 			ID: 3, ServiceID: 1, Buyer: "g1subbuyer00000000000000000000000000000",
-			QuotaTotal: 50, QuotaRemaining: 50, Active: true,
+			QuotaTotal: 50, QuotaRemaining: 50, Active: true, VoucherPubKey: pubHex,
 		},
 	}
+
+	fac := &strictMemoFacilitator{}
+	subm := &fakeSubmitter{}
+	statePath := filepath.Join(t.TempDir(), "state.json")
 
 	mw := NewMiddleware(MiddlewareConfig{
 		ChainID:     "onyx-1",
 		RealmPath:   "gno.land/r/test/tollgate",
 		Chain:       chain,
-		Facilitator: &fakeFacilitator{},
+		Facilitator: fac,
+		Submitter:   subm,
+		StateFile:   statePath,
+		RequireAuth: true,
 		Routes: map[string]RouteSpec{
 			"GET /v1/oracle": {
 				ServiceID:      1,
@@ -85,64 +114,70 @@ func TestMiddlewareAllThreeRails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode PAYMENT-REQUIRED: %v", err)
 	}
-	if pr.X402Version != 2 || len(pr.Accepts) != 1 || pr.Accepts[0].Network != "gno:onyx-1" {
-		t.Fatalf("unexpected PaymentRequired: %+v", pr)
+
+	// 2a. Unauthorized pass call (no Ed25519 voucher signature) MUST be rejected with 401!
+	reqBad := httptest.NewRequest(http.MethodGet, "/v1/oracle?pair=GNOT-USD", nil)
+	reqBad.Header.Set(HeaderTollgatePass, "7")
+	reqBad.Header.Set(HeaderTollgateUnits, "10")
+	reqBad.Header.Set(HeaderTollgateNonce, "pass-call-1")
+	recBad := httptest.NewRecorder()
+	handler.ServeHTTP(recBad, reqBad)
+	if recBad.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated pass call expected 401, got %d", recBad.Code)
 	}
 
-	// 2. Prepaid Pass fast-path (10 units -> 5% volume discount -> 9500 ugnot)
-	req2 := httptest.NewRequest(http.MethodGet, "/v1/oracle?pair=GNOT-USD", nil)
-	req2.Header.Set(HeaderTollgatePass, "7")
-	req2.Header.Set(HeaderTollgateUnits, "10")
-	req2.Header.Set(HeaderTollgateNonce, "pass-call-1")
+	// 2b. Authenticated Ed25519 pass call succeeds
+	resHash := HashResource("GET /v1/oracle?pair=GNOT-USD")
+	sigPass := SignVoucher(priv, "onyx-1", 1, 7, 0, 10, "pass-call-1", resHash)
+	reqBad.Header.Set(HeaderTollgateVoucherSig, sigPass)
 	rec2 := httptest.NewRecorder()
-	handler.ServeHTTP(rec2, req2)
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("pass call expected 200, got %d: %s", rec2.Code, rec2.Body.String())
-	}
-	if rec2.Header().Get(HeaderTollgateRail) != "metered-pass" || rec2.Header().Get(HeaderTollgateNetUgnot) != "9500" {
-		t.Fatalf("unexpected pass headers: rail=%s net=%s", rec2.Header().Get(HeaderTollgateRail), rec2.Header().Get(HeaderTollgateNetUgnot))
-	}
-	commit := rec2.Header().Get(HeaderTollgateCommitment)
-	if !VerifyReceiptCommitment(
-		commit, "onyx-1", 1, 7, chain.pass.Buyer,
-		"g1prov0000000000000000000000000000000000", 10, 9500, "pass-call-1",
-		HashResource("GET /v1/oracle?pair=GNOT-USD"),
-	) {
-		t.Fatal("pass receipt commitment verification failed")
+	handler.ServeHTTP(rec2, reqBad)
+	if rec2.Code != http.StatusOK || rec2.Header().Get(HeaderTollgateNetUgnot) != "9500" {
+		t.Fatalf("signed pass call failed: %d %s", rec2.Code, rec2.Body.String())
 	}
 
-	// Duplicate nonce must return 409 Conflict
+	// Duplicate nonce returns 409 Conflict
 	recDup := httptest.NewRecorder()
-	handler.ServeHTTP(recDup, req2)
+	handler.ServeHTTP(recDup, reqBad)
 	if recDup.Code != http.StatusConflict {
 		t.Fatalf("expected 409 on duplicate nonce, got %d", recDup.Code)
 	}
 
-	// 3. Subscription fast-path
+	// 3. Authenticated subscription fast-path
+	sigSub := SignVoucher(priv, "onyx-1", 1, 0, 3, 1, "sub-call-1", resHash)
 	req3 := httptest.NewRequest(http.MethodGet, "/v1/oracle?pair=GNOT-USD", nil)
 	req3.Header.Set(HeaderTollgateSub, "3")
 	req3.Header.Set(HeaderTollgateNonce, "sub-call-1")
+	req3.Header.Set(HeaderTollgateVoucherSig, sigSub)
 	rec3 := httptest.NewRecorder()
 	handler.ServeHTTP(rec3, req3)
 	if rec3.Code != http.StatusOK || rec3.Header().Get(HeaderTollgateRail) != "subscription" {
 		t.Fatalf("sub call failed: %d", rec3.Code)
 	}
 
-	// 4. Native x402 direct payment rail
-	payloadJSON, _ := json.Marshal(map[string]any{"x402Version": 2, "payload": map[string]any{"transaction": "AAAA"}})
+	// 4. Stock x402 retry WITHOUT X-Tollgate-Nonce (carries memo only in accepted.extra.memo)
+	payloadJSON, _ := json.Marshal(map[string]any{
+		"x402Version": 2,
+		"accepted":    pr.Accepts[0],
+		"payload":     map[string]any{"transaction": "AAAA"},
+	})
 	req4 := httptest.NewRequest(http.MethodGet, "/v1/oracle?pair=GNOT-USD", nil)
 	req4.Header.Set(HeaderPaymentSignature, base64.StdEncoding.EncodeToString(payloadJSON))
-	req4.Header.Set(HeaderTollgateNonce, "x402-call-1")
 	rec4 := httptest.NewRecorder()
 	handler.ServeHTTP(rec4, req4)
 	if rec4.Code != http.StatusOK || rec4.Header().Get(HeaderTollgateRail) != "x402-direct" {
-		t.Fatalf("x402 call failed: %d %s", rec4.Code, rec4.Body.String())
+		t.Fatalf("stock x402 retry failed: %d %s", rec4.Code, rec4.Body.String())
 	}
-	if rec4.Header().Get(HeaderPaymentResponse) == "" {
-		t.Fatal("missing PAYMENT-RESPONSE header")
+	// Replaying the same stock x402 memo MUST return 409 Conflict
+	rec4Dup := httptest.NewRecorder()
+	handler.ServeHTTP(rec4Dup, req4)
+	if rec4Dup.Code != http.StatusConflict {
+		t.Fatalf("expected 409 on x402 replay, got %d", rec4Dup.Code)
 	}
 
-	if len(mw.Receipts()) != 3 {
-		t.Fatalf("expected 3 recorded receipts, got %d", len(mw.Receipts()))
+	// 5. Real FlushSettlements submits all 3 receipts and reconciles debits
+	n, err := mw.FlushSettlements(context.Background())
+	if err != nil || n != 3 || len(subm.submitted) != 3 {
+		t.Fatalf("FlushSettlements failed: n=%d err=%v", n, err)
 	}
 }

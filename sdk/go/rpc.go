@@ -47,7 +47,8 @@ type ServiceInfo struct {
 	Paused          bool   `json:"paused"`
 	CreatedHeight   int64  `json:"createdHeight"`
 	TotalCalls      int64  `json:"totalCalls"`
-	TotalRevenue    int64  `json:"totalRevenue"`
+	EscrowedRevenue     int64  `json:"escrowedRevenue"`
+	X402AttestedRevenue int64  `json:"x402AttestedRevenue"`
 }
 
 type PassInfo struct {
@@ -63,6 +64,7 @@ type PassInfo struct {
 	OpenedHeight    int64  `json:"openedHeight"`
 	Closed          bool   `json:"closed"`
 	UsedSessionKey  bool   `json:"usedSessionKey"`
+	VoucherPubKey   string `json:"voucherPubKey"`
 	SettledCalls    int64  `json:"settledCalls"`
 	CurrentHeight   int64  `json:"currentHeight"`
 }
@@ -78,6 +80,7 @@ type SubscriptionInfo struct {
 	StartHeight    int64  `json:"startHeight"`
 	ExpiryHeight   int64  `json:"expiryHeight"`
 	Active         bool   `json:"active"`
+	VoucherPubKey  string `json:"voucherPubKey"`
 	CurrentHeight  int64  `json:"currentHeight"`
 }
 
@@ -86,7 +89,10 @@ type ReceiptInfo struct {
 	Rail         string `json:"rail"`
 	ServiceID    uint64 `json:"serviceId"`
 	PassID       uint64 `json:"passId"`
-	SubID        uint64 `json:"subId"`
+	SubID            uint64 `json:"subId"`
+	SettlementID     uint64 `json:"settlementId"`
+	SettlementStatus string `json:"settlementStatus"`
+	BuyerSigned      bool   `json:"buyerSigned"`
 	Buyer        string `json:"buyer"`
 	Provider     string `json:"provider"`
 	Units        int64  `json:"units"`

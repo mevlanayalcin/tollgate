@@ -153,3 +153,31 @@ func (f *HTTPFacilitator) Settle(ctx context.Context, paymentHeader string, req 
 	err := f.call(ctx, "/settle", paymentHeader, req, &out)
 	return out, err
 }
+
+const HeaderTollgateVoucherSig = "X-Tollgate-Voucher-Sig"
+
+// ExtractX402AcceptedMemo decodes a stock x402 v2 base64 PAYMENT-SIGNATURE
+// header and extracts accepted.extra.memo so stock @gnolang/x402 and Go clients
+// never fail with memo_mismatch when retrying without custom headers.
+func ExtractX402AcceptedMemo(paymentHeader string) (string, bool) {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(paymentHeader))
+	if err != nil {
+		return "", false
+	}
+	var doc struct {
+		Accepted struct {
+			Extra map[string]any `json:"extra"`
+		} `json:"accepted"`
+		Extra map[string]any `json:"extra"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return "", false
+	}
+	if m, ok := doc.Accepted.Extra["memo"].(string); ok && m != "" {
+		return m, true
+	}
+	if m, ok := doc.Extra["memo"].(string); ok && m != "" {
+		return m, true
+	}
+	return "", false
+}

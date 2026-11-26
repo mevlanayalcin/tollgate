@@ -1,9 +1,21 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  generateKeyPairSync,
+  sign,
+  timingSafeEqual,
+  verify,
+} from "node:crypto";
 
 export const PROTOCOL_VERSION = "tollgate-v1";
 export const RECEIPT_DOMAIN = "tollgate-receipt-v1";
+export const VOUCHER_DOMAIN = "tollgate-voucher-v1";
 export const MEMO_PREFIX = "tollgate:v1:";
 export const MAX_MEMO_BYTES = 256;
+
+const ED25519_PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
+const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 
 export interface ChargeBreakdown {
   units: bigint;
@@ -132,6 +144,74 @@ export function verifyReceiptCommitment(
   return timingSafeEqual(Buffer.from(got, "utf8"), Buffer.from(expectedHex, "utf8"));
 }
 
+export function voucherMessage(params: {
+  chainId: string;
+  serviceId: bigint;
+  passId: bigint;
+  subId: bigint;
+  units: bigint;
+  nonce: string;
+  resourceHash: string;
+}): string {
+  return (
+    `${VOUCHER_DOMAIN}|` +
+    lp(params.chainId) +
+    `${params.serviceId.toString()}|` +
+    `${params.passId.toString()}|` +
+    `${params.subId.toString()}|` +
+    `${params.units.toString()}|` +
+    lp(params.nonce) +
+    lp(params.resourceHash)
+  );
+}
+
+export function generateVoucherKeypair(): { publicKeyHex: string; seedHex: string } {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const spki = publicKey.export({ format: "der", type: "spki" });
+  const pkcs8 = privateKey.export({ format: "der", type: "pkcs8" });
+  return {
+    publicKeyHex: spki.subarray(spki.length - 32).toString("hex"),
+    seedHex: pkcs8.subarray(pkcs8.length - 32).toString("hex"),
+  };
+}
+
+export function signVoucher(
+  seedOrPrivKeyHex: string,
+  params: Parameters<typeof voucherMessage>[0]
+): string {
+  const raw = Buffer.from(seedOrPrivKeyHex.trim(), "hex");
+  const seed = raw.length === 64 ? raw.subarray(0, 32) : raw;
+  if (seed.length !== 32) {
+    throw new Error("tollgate: expected 32-byte Ed25519 seed or 64-byte private key hex");
+  }
+  const keyObj = createPrivateKey({
+    key: Buffer.concat([ED25519_PKCS8_PREFIX, seed]),
+    format: "der",
+    type: "pkcs8",
+  });
+  const msg = Buffer.from(voucherMessage(params), "utf8");
+  return sign(null, msg, keyObj).toString("hex");
+}
+
+export function verifyVoucher(
+  publicKeyHex: string,
+  sigHex: string,
+  params: Parameters<typeof voucherMessage>[0]
+): boolean {
+  if (!/^[0-9a-f]{64}$/.test(publicKeyHex) || !/^[0-9a-f]{128}$/.test(sigHex)) {
+    return false;
+  }
+  const pub = Buffer.from(publicKeyHex, "hex");
+  const sig = Buffer.from(sigHex, "hex");
+  const keyObj = createPublicKey({
+    key: Buffer.concat([ED25519_SPKI_PREFIX, pub]),
+    format: "der",
+    type: "spki",
+  });
+  const msg = Buffer.from(voucherMessage(params), "utf8");
+  return verify(null, msg, keyObj, sig);
+}
+
 export function decodePaymentRequired(headerValue: string): PaymentRequired {
   const jsonText = Buffer.from(headerValue.trim(), "base64").toString("utf8");
   return JSON.parse(jsonText) as PaymentRequired;
@@ -148,7 +228,7 @@ export class TollgateClient {
 
   async queryRender(subPath: string): Promise<string> {
     const dataHex = Buffer.from(`${this.realmPath}:${subPath}`, "utf8").toString("hex");
-    const url = `${this.rpcUrl}/abci_query?path=${encodeURIComponent('"vm/qrender"')}&data=0x${dataHex}`;
+    const url = `${this.rpcUrl}/abci_query?path=${encodeURIComponent(vm/qrender)}&data=0x${dataHex}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
     const body = (await res.json()) as {
@@ -169,7 +249,13 @@ export class TollgateClient {
 
   async fetchWithPass(
     url: string,
-    opts: { passId?: bigint; subId?: bigint; units?: bigint; nonce?: string }
+    opts: {
+      passId?: bigint;
+      subId?: bigint;
+      units?: bigint;
+      nonce?: string;
+      voucherSigHex?: string;
+    }
   ): Promise<{
     response: Response;
     rail: string | null;
@@ -183,6 +269,7 @@ export class TollgateClient {
     else if (opts.passId !== undefined) headers.set("X-Tollgate-Pass", opts.passId.toString());
     if (opts.units !== undefined) headers.set("X-Tollgate-Units", opts.units.toString());
     if (opts.nonce) headers.set("X-Tollgate-Nonce", opts.nonce);
+    if (opts.voucherSigHex) headers.set("X-Tollgate-Voucher-Sig", opts.voucherSigHex);
 
     const response = await fetch(url, { headers });
     return {

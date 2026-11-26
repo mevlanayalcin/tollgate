@@ -224,3 +224,32 @@ func HashResource(descriptor string) string {
 	sum := sha256.Sum256([]byte(descriptor))
 	return hex.EncodeToString(sum[:])
 }
+
+const VoucherDomain = "tollgate-voucher-v1"
+
+// VoucherMessage matches gno.land/r/<addr>/tollgate.VoucherMessage byte-for-byte.
+func VoucherMessage(
+	chainID string,
+	serviceID uint64,
+	passID uint64,
+	subID uint64,
+	units int64,
+	nonce string,
+	resourceHash string,
+) string {
+	var b strings.Builder
+	b.WriteString(VoucherDomain)
+	b.WriteByte('|')
+	appendLP(&b, chainID)
+	b.WriteString(strconv.FormatUint(serviceID, 10))
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatUint(passID, 10))
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatUint(subID, 10))
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatInt(units, 10))
+	b.WriteByte('|')
+	appendLP(&b, nonce)
+	appendLP(&b, resourceHash)
+	return b.String()
+}
